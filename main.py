@@ -198,16 +198,20 @@ class BiaffineParser(torch.nn.Module):
         minus_mask = (1 - float_mask) * minus_inf
         attended_arcs = attended_arcs + minus_mask.unsqueeze(2) + minus_mask.unsqueeze(1)
 
-        if self.training or not self.use_mst_decoding_for_validation:
-            predicted_heads, predicted_head_tags = self._greedy_decode(head_tag_representation,
-                                                                       child_tag_representation,
-                                                                       attended_arcs,
-                                                                       mask)
+        if not self.training:
+            if self.use_mst_decoding_for_validation:
+                predicted_heads, predicted_head_tags = self._greedy_decode(head_tag_representation,
+                                                                           child_tag_representation,
+                                                                           attended_arcs,
+                                                                           mask)
+            else:
+                predicted_heads, predicted_head_tags = self._mst_decode(head_tag_representation,
+                                                                        child_tag_representation,
+                                                                        attended_arcs,
+                                                                        mask)
         else:
-            predicted_heads, predicted_head_tags = self._mst_decode(head_tag_representation,
-                                                                    child_tag_representation,
-                                                                    attended_arcs,
-                                                                    mask)
+            predicted_heads, predicted_head_tags = None, None
+
         if head_indices is not None and head_tags is not None:
 
             arc_nll, tag_nll = self._construct_loss(head_tag_representation=head_tag_representation,
@@ -406,15 +410,16 @@ def eval_model(model: BiaffineParser,
     for inputs, head_indices, head_tags, order in batcher.get():
         forward_output_dict = model.forward(inputs, head_tags, head_indices)
         for bid in range(len(inputs['text'])):
-            heads = forward_output_dict["heads"][bid]
-            tags = forward_output_dict["head_tags"][bid]
-            results.append(list(zip(heads, tags)))
+            heads = forward_output_dict["heads"][bid][1:]
+            tags = forward_output_dict["head_tags"][bid][1:]
+            length = inputs['length'][bid].item()
+            result = [(head.item(), tag.item()) for i, (head, tag) in enumerate(zip(heads, tags)) if i < length]
+            results.append(result)
         orders.extend(order)
 
     for order in orders:
         for i, (head, tag) in enumerate(results[order]):
-            head, tag = head.item(), tag.item()
-            print('{0}\t_\t_\t_\t_\t_{1}\t{2}_\t_'.format(i + 1, head, ix2label[tag]), file=fpo)
+            print('{0}\t_\t_\t_\t_\t_\t{1}\t{2}\t_\t_'.format(i + 1, head, ix2label[tag]), file=fpo)
         print(file=fpo)
     fpo.close()
 
@@ -713,9 +718,11 @@ def test():
         cnt += 1
         forward_output_dict = model.forward(inputs, head_tags, head_indices)
         for bid in range(len(inputs['text'])):
-            heads = forward_output_dict["heads"][bid]
-            tags = forward_output_dict["head_tags"][bid]
-            results.append(list(zip(heads, tags)))
+            heads = forward_output_dict["heads"][bid][1:]
+            tags = forward_output_dict["head_tags"][bid][1:]
+            length = inputs['length'][bid].item()
+            result = [(head.item(), tag.item()) for i, (head, tag) in enumerate(zip(heads, tags)) if i < length]
+            results.append(result)
         if cnt % model_cmd_opt.report_steps == 0:
             logger.info('finished {0} x {1} batches'.format(cnt, model_cmd_opt.batch_size))
         orders.extend(order)

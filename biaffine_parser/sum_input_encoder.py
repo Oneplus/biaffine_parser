@@ -12,14 +12,15 @@ class SummationInputEncoder(InputEncoderBase):
         self.input_info_ = input_info_
         self.output_dim_ = output_dim_
 
-        self.projections = {}
+        projections = {}
         self.ordered_names = []
         for i, (name, dim) in enumerate(input_info_.items()):
             if i == 0:
-                self.projections[name] = torch.nn.Linear(dim, output_dim_)
+                projections[name] = torch.nn.Linear(dim, output_dim_)
             else:
-                self.projections[name] = torch.nn.Linear(dim, output_dim_, bias=False)
+                projections[name] = torch.nn.Linear(dim, output_dim_, bias=False)
             self.ordered_names.append(name)
+        self.projections = torch.nn.ModuleDict(projections)
 
     def forward(self, inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
         arbitrary_input_ = next(iter(inputs.values()))

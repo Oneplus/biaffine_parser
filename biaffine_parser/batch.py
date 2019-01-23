@@ -82,10 +82,12 @@ class LengthBatch(InputBatchBase):
         super(LengthBatch, self).__init__(use_cuda)
 
     def create_one_batch(self, raw_dataset: List[List[List[str]]]):
-        batch_size, seq_len = len(raw_dataset), max([len(input_) for input_ in raw_dataset])
-        ret = torch.LongTensor(batch_size, seq_len).fill_(0)
+        batch_size = len(raw_dataset)
+        ret = torch.LongTensor(batch_size).fill_(0)
         for i, raw_data_ in enumerate(raw_dataset):
             ret[i] = len(raw_data_)
+        if self.use_cuda:
+            ret = ret.cuda()
         return ret
 
     def get_field(self):
