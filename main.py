@@ -16,21 +16,30 @@ import codecs
 import tempfile
 import subprocess
 import time
-from biaffine_parser.batch import Batcher, HeadBatch, RelationBatch, InputBatch, TextBatch, LengthBatch
-from biaffine_parser.embedding_layer import load_embedding_txt
-from biaffine_parser.embedding_layer import EmbeddingLayer
+import collections
+from biaffine_parser.batch import BatcherBase, Batcher, BucketBatcher
+from biaffine_parser.batch import HeadBatch, RelationBatch, InputBatch, CharacterBatch
+from biaffine_parser.batch import TextBatch, LengthBatch
+from biaffine_parser.embeddings import load_embedding_txt
+from biaffine_parser.embeddings import Embeddings
+from biaffine_parser.lstm_token_encoder import LstmTokenEmbedder
+from biaffine_parser.cnn_token_encoder import ConvTokenEmbedder
 from biaffine_parser.elmo import ContextualizedWordEmbeddings
-from biaffine_parser.sum_input_encoder import SummationInputEncoder
+from biaffine_parser.sum_input_encoder import AffineTransformInputEncoder, SummationInputEncoder
 from biaffine_parser.concat_input_encoder import ConcatenateInputEncoder
+from biaffine_parser.nadam import Nadam
+from biaffine_parser.partial_bilinear_matrix_attention import PartialBilinearMatrixAttention
+from biaffine_parser.bilinear_with_bias import BilinearWithBias
 from allennlp.nn.activations import Activation
 from allennlp.modules.input_variational_dropout import InputVariationalDropout
 from allennlp.modules.matrix_attention.bilinear_matrix_attention import BilinearMatrixAttention
 from allennlp.modules.feedforward import FeedForward
 from allennlp.modules.seq2seq_encoders.seq2seq_encoder import Seq2SeqEncoder
 from allennlp.common.params import Params
-from allennlp.nn.util import get_text_field_mask, get_range_vector
+from allennlp.nn.util import get_mask_from_sequence_lengths, get_range_vector
 from allennlp.nn.chu_liu_edmonds import decode_mst
 from allennlp.nn.util import get_device_of, masked_log_softmax, get_lengths_from_binary_sequence_mask
+from allennlp.training.optimizers import DenseSparseAdam
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
                     level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -45,9 +54,30 @@ def read_corpus(path: str):
     for block in open(path, 'r').read().strip().split('\n\n'):
         items = []
         for line in block.splitlines():
-            items.append(line.split())
+            fields = line.strip().split()
+            assert len(fields) == 10
+            items.append(fields)
         ret.append(items)
     return ret
+
+
+class TimeRecoder(object):
+    def __init__(self):
+        self.total_eclipsed_time_ = 0
+
+    def __enter__(self):
+        self.start_time_ = time.time()
+        return self.start_time_
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        current_time = time.time()
+        self.total_eclipsed_time_ += current_time - self.start_time_
+
+    def total_eclipsed_time(self):
+        return self.total_eclipsed_time_
+
+    def reset(self):
+        self.total_eclipsed_time_ = 0
 
 
 class BiaffineParser(torch.nn.Module):
@@ -71,15 +101,32 @@ class BiaffineParser(torch.nn.Module):
                     embs = None
                 name = c['name']
                 mapping = input_batchers[name].mapping
-                layer = EmbeddingLayer(name, c['dim'], mapping, fix_emb=c['fixed'],
-                                       embs=embs, normalize=c.get('normalize', False))
-                logger.info('embedding layer for field {0} '
+                layer = Embeddings(name, c['dim'], mapping, fix_emb=c['fixed'],
+                                   embs=embs, normalize=c.get('normalize', False))
+                logger.info('embedding for field {0} '
                             'created with {1} x {2}.'.format(c['field'], layer.n_V, layer.n_d))
                 input_layers[name] = layer
+
+            elif c['type'] == 'cnn_encoder' or c['type'] == 'lstm_encoder':
+                name = c['name']
+                mapping = input_batchers[name].mapping
+                embeddings = Embeddings('{0}_ch_emb', c['dim'], mapping, fix_emb=False, embs=None, normalize=False)
+                logger.info('character embedding for field {0} '
+                            'created with {1} x {2}.'.format(c['field'], embeddings.n_V, embeddings.n_d))
+                if c['type'] == 'lstm_encoder':
+                    layer = LstmTokenEmbedder(name, c['dim'], embeddings, conf['dropout'], use_cuda)
+                elif c['type'] == 'cnn_encoder':
+                    layer = ConvTokenEmbedder(name, c['dim'], embeddings, c['filters'], c.get('n_highway', 1),
+                                              c.get('activation', 'relu'), use_cuda)
+                else:
+                    raise ValueError('Unknown type: {}'.format(c['type']))
+                input_layers[name] = layer
+
             elif c['type'] == 'elmo':
                 name = c['name']
                 layer = ContextualizedWordEmbeddings(name, c['path'], use_cuda)
                 input_layers[name] = layer
+
             else:
                 raise ValueError('{} unknown input layer'.format(c['type']))
 
@@ -91,8 +138,10 @@ class BiaffineParser(torch.nn.Module):
             input_info = {name: [entry['dim'] for entry in conf['input'] if entry['name'] == name][0]
                           for name in c['input']}
 
-            if c['type'] == 'sum':
-                input_encoder = SummationInputEncoder(input_info, c['dim'], use_cuda)
+            if c['type'] == 'affine':
+                input_encoder = AffineTransformInputEncoder(input_info, c['dim'], use_cuda)
+            elif c['type'] == 'sum':
+                input_encoder = SummationInputEncoder(input_info, use_cuda)
             elif c['type'] == 'concat':
                 input_encoder = ConcatenateInputEncoder(input_info, use_cuda)
             else:
@@ -114,121 +163,128 @@ class BiaffineParser(torch.nn.Module):
 
         encoder_dim = self.encoder.get_output_dim()
         c = conf['biaffine_parser']
-        arc_representation_dim = c['arc_representation_dim']
-        tag_representation_dim = c['tag_representation_dim']
+        self.arc_representation_dim = arc_representation_dim = c['arc_representation_dim']
+        self.tag_representation_dim = tag_representation_dim = c['tag_representation_dim']
 
         self.head_sentinel_ = torch.nn.Parameter(torch.randn([1, 1, encoder_dim]))
 
-        self.head_arc_feedforward = FeedForward(encoder_dim, 1, arc_representation_dim,
-                                                Activation.by_name("elu")())
-        self.child_arc_feedforward = FeedForward(encoder_dim, 1, arc_representation_dim,
-                                                 Activation.by_name("elu")())
+        self.head_arc_feedforward = FeedForward(encoder_dim, 1, arc_representation_dim, Activation.by_name("elu")())
+        self.child_arc_feedforward = FeedForward(encoder_dim, 1, arc_representation_dim, Activation.by_name("elu")())
 
-        self.arc_attention = BilinearMatrixAttention(arc_representation_dim,
-                                                     arc_representation_dim,
+        self.head_tag_feedforward = FeedForward(encoder_dim, 1, tag_representation_dim, Activation.by_name("elu")())
+        self.child_tag_feedforward = FeedForward(encoder_dim, 1, tag_representation_dim, Activation.by_name("elu")())
+
+        self.arc_attention = BilinearMatrixAttention(arc_representation_dim, arc_representation_dim,
                                                      use_input_biases=True)
 
-        self.head_tag_feedforward = FeedForward(encoder_dim, 1, tag_representation_dim,
-                                                Activation.by_name("elu")())
-        self.child_tag_feedforward = FeedForward(encoder_dim, 1, tag_representation_dim,
-                                                 Activation.by_name("elu")())
+        self.tag_bilinear = BilinearWithBias(tag_representation_dim, tag_representation_dim, n_relations)
 
-        self.tag_bilinear = torch.nn.Bilinear(tag_representation_dim,
-                                              tag_representation_dim,
-                                              n_relations)
-
-        self.input_dropout_ = torch.nn.Dropout(p=conf['dropout'])
+        self.input_dropout_ = torch.nn.Dropout2d(p=conf['dropout'])
         self.dropout_ = InputVariationalDropout(p=conf['dropout'])
+
+        self.input_encoding_timer = TimeRecoder()
+        self.context_encoding_timer = TimeRecoder()
+        self.classification_timer = TimeRecoder()
 
     def forward(self, inputs: Dict[str, Any],
                 head_tags: torch.LongTensor = None,
                 head_indices: torch.LongTensor = None):
-        embeded_input = {}
-        for name, input_ in inputs.items():
-            if name == 'text' or name == 'length':
-                continue
-            fn = self.input_layers[name]
-            embeded_input[name] = fn(input_)
+        with self.input_encoding_timer as _:
+            embeded_input = {}
+            for name, input_ in inputs.items():
+                if name == 'text' or name == 'length':
+                    continue
+                fn = self.input_layers[name]
+                embeded_input[name] = fn(input_)
 
-        encoded_input = []
-        for encoder_ in self.input_encoders:
-            ordered_names = encoder_.get_ordered_names()
-            args_ = {name: embeded_input[name] for name in ordered_names}
-            encoded_input.append(encoder_(args_))
+            encoded_input = []
+            for encoder_ in self.input_encoders:
+                ordered_names = encoder_.get_ordered_names()
+                args_ = {name: embeded_input[name] for name in ordered_names}
+                encoded_input.append(encoder_(args_))
 
-        encoded_input = torch.cat(encoded_input, dim=-1)
-        encoded_input = self.input_dropout_(encoded_input)
-        # encoded_input: (batch_size, seq_len, input_dim)
+            encoded_input = torch.cat(encoded_input, dim=-1)
+            # encoded_input: (batch_size, seq_len, input_dim)
 
-        mask = get_text_field_mask(embeded_input)
-        # mask: (batch_size, seq_len)
+        with self.context_encoding_timer as _:
+            mask = get_mask_from_sequence_lengths(inputs['length'], inputs['length'].max())
+            # mask: (batch_size, seq_len)
 
-        context_encoded_input = self.input_dropout_(encoded_input)
-        context_encoded_input = self.encoder(context_encoded_input, mask)
-        # context_encoded_input: (batch_size, seq_len, encoded_dim)
+            context_encoded_input = self.encoder(encoded_input, mask)
+            # context_encoded_input: (batch_size, seq_len, encoded_dim)
 
-        batch_size, _, encoding_dim = context_encoded_input.size()
+            batch_size, _, encoding_dim = context_encoded_input.size()
 
-        # handle the sentinel/dummy root.
-        head_sentinel = self.head_sentinel_.expand(batch_size, 1, encoding_dim)
-        context_encoded_input = torch.cat([head_sentinel, context_encoded_input], 1)
-        # context_encoded_input: (batch_size, seq_len + 1, encoded_dim)
-        mask = torch.cat([mask.new_ones(batch_size, 1), mask], 1)
-        # mask: (batch_size, seq_len + 1)
+            # handle the sentinel/dummy root.
+            head_sentinel = self.head_sentinel_.expand(batch_size, 1, encoding_dim)
+            context_encoded_input = torch.cat([head_sentinel, context_encoded_input], 1)
+            # context_encoded_input: (batch_size, seq_len + 1, encoded_dim)
+            mask = torch.cat([mask.new_ones(batch_size, 1), mask], 1)
+            # mask: (batch_size, seq_len + 1)
 
-        if head_indices is not None:
-            head_indices = torch.cat([head_indices.new_zeros(batch_size, 1), head_indices], 1)
-        if head_tags is not None:
-            head_tags = torch.cat([head_tags.new_zeros(batch_size, 1), head_tags], 1)
-        float_mask = mask.float()
-        context_encoded_input = self.dropout_(context_encoded_input)
+            if head_indices is not None:
+                head_indices = torch.cat([head_indices.new_zeros(batch_size, 1), head_indices], 1)
+            if head_tags is not None:
+                head_tags = torch.cat([head_tags.new_zeros(batch_size, 1), head_tags], 1)
+            float_mask = mask.float()
+            context_encoded_input = self.input_dropout_(context_encoded_input)
 
-        # head_arc_representation / child_arc_representation
-        # head_tag_representation / child_tag_representation: (batch_size, seq_len + 1, encoded_dim)
-        head_arc_representation = self.dropout_(self.head_arc_feedforward(context_encoded_input))
-        child_arc_representation = self.dropout_(self.child_arc_feedforward(context_encoded_input))
+        with self.classification_timer as _:
+            head_arc_representation = self.head_arc_feedforward(context_encoded_input)
+            child_arc_representation = self.child_arc_feedforward(context_encoded_input)
 
-        head_tag_representation = self.dropout_(self.head_tag_feedforward(context_encoded_input))
-        child_tag_representation = self.dropout_(self.child_tag_feedforward(context_encoded_input))
+            head_tag_representation = self.head_tag_feedforward(context_encoded_input)
+            child_tag_representation = self.child_tag_feedforward(context_encoded_input)
 
-        # attended_arcs: (batch_size, seq_len + 1, seq_len + 1)
-        attended_arcs = self.arc_attention(head_arc_representation, child_arc_representation)
+            # head_arc_representation / child_arc_representation
+            # head_tag_representation / child_tag_representation: (batch_size, seq_len + 1, encoded_dim)
+            arc_representation = self.dropout_(torch.cat([head_arc_representation, child_arc_representation], dim=1))
+            tag_representation = self.dropout_(torch.cat([head_tag_representation, child_tag_representation], dim=1))
 
-        minus_inf = -1e8
-        minus_mask = (1 - float_mask) * minus_inf
-        attended_arcs = attended_arcs + minus_mask.unsqueeze(2) + minus_mask.unsqueeze(1)
+            head_arc_representation, child_arc_representation = arc_representation.chunk(2, dim=1)
+            head_tag_representation, child_tag_representation = tag_representation.chunk(2, dim=1)
 
-        if not self.training:
-            if self.use_mst_decoding_for_validation:
-                predicted_heads, predicted_head_tags = self._greedy_decode(head_tag_representation,
-                                                                           child_tag_representation,
-                                                                           attended_arcs,
-                                                                           mask)
+            head_tag_representation = head_tag_representation.contiguous()
+            child_tag_representation = child_tag_representation.contiguous()
+
+            # attended_arcs: (batch_size, seq_len + 1, seq_len + 1)
+            attended_arcs = self.arc_attention(head_arc_representation, child_arc_representation)
+
+            minus_inf = -1e8
+            minus_mask = (1 - float_mask) * minus_inf
+            attended_arcs = attended_arcs + minus_mask.unsqueeze(2) + minus_mask.unsqueeze(1)
+
+            if not self.training:
+                if not self.use_mst_decoding_for_validation:
+                    predicted_heads, predicted_head_tags = self._greedy_decode(head_tag_representation,
+                                                                               child_tag_representation,
+                                                                               attended_arcs,
+                                                                               mask)
+                else:
+                    predicted_heads, predicted_head_tags = self._mst_decode(head_tag_representation,
+                                                                            child_tag_representation,
+                                                                            attended_arcs,
+                                                                            mask)
             else:
-                predicted_heads, predicted_head_tags = self._mst_decode(head_tag_representation,
-                                                                        child_tag_representation,
-                                                                        attended_arcs,
-                                                                        mask)
-        else:
-            predicted_heads, predicted_head_tags = None, None
+                predicted_heads, predicted_head_tags = None, None
 
-        if head_indices is not None and head_tags is not None:
+            if head_indices is not None and head_tags is not None:
 
-            arc_nll, tag_nll = self._construct_loss(head_tag_representation=head_tag_representation,
-                                                    child_tag_representation=child_tag_representation,
-                                                    attended_arcs=attended_arcs,
-                                                    head_indices=head_indices,
-                                                    head_tags=head_tags,
-                                                    mask=mask)
-            loss = arc_nll + tag_nll
-        else:
-            arc_nll, tag_nll = self._construct_loss(head_tag_representation=head_tag_representation,
-                                                    child_tag_representation=child_tag_representation,
-                                                    attended_arcs=attended_arcs,
-                                                    head_indices=predicted_heads.long(),
-                                                    head_tags=predicted_head_tags.long(),
-                                                    mask=mask)
-            loss = arc_nll + tag_nll
+                arc_nll, tag_nll = self._construct_loss(head_tag_representation=head_tag_representation,
+                                                        child_tag_representation=child_tag_representation,
+                                                        attended_arcs=attended_arcs,
+                                                        head_indices=head_indices,
+                                                        head_tags=head_tags,
+                                                        mask=mask)
+                loss = arc_nll + tag_nll
+            else:
+                arc_nll, tag_nll = self._construct_loss(head_tag_representation=head_tag_representation,
+                                                        child_tag_representation=child_tag_representation,
+                                                        attended_arcs=attended_arcs,
+                                                        head_indices=predicted_heads.long(),
+                                                        head_tags=predicted_head_tags.long(),
+                                                        mask=mask)
+                loss = arc_nll + tag_nll
 
         output_dict = {
                 "heads": predicted_heads,
@@ -391,6 +447,11 @@ class BiaffineParser(torch.nn.Module):
                                             child_tag_representation)
         return head_tag_logits
 
+    def reset_timer(self):
+        self.input_encoding_timer.reset()
+        self.context_encoding_timer.reset()
+        self.classification_timer.reset()
+
 
 def eval_model(model: BiaffineParser,
                batcher: Batcher,
@@ -435,46 +496,55 @@ def eval_model(model: BiaffineParser,
 
 def train_model(epoch: int,
                 opt: argparse.Namespace,
+                conf: Dict,
                 model: BiaffineParser,
                 optimizer: torch.optim.Optimizer,
-                train_batch: Batcher,
+                lr: torch.optim.lr_scheduler.StepLR,
+                train_batch: BatcherBase,
                 valid_batch: Batcher,
                 test_batch: Batcher,
                 ix2label: Dict,
                 best_valid: float,
                 test_result: float):
+    model.reset_timer()
     model.train()
 
     total_loss, total_tag = 0.0, 0
     cnt = 0
     start_time = time.time()
 
+    witnessed_improved_valid_result = False
     for inputs, head_indices, head_tags, _ in train_batch.get():
         cnt += 1
         model.zero_grad()
         forward_output_dict = model.forward(inputs, head_tags, head_indices)
         loss = forward_output_dict['loss']
 
-        total_loss += loss.item()
         n_tags = inputs['length'].sum().item()
+        total_loss += loss.item() * n_tags
         total_tag += n_tags
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), opt.clip_grad)
+        if 'clip_grad' in conf['optimizer']:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), conf['optimizer']['clip_grad'])
+
         optimizer.step()
+        if lr:
+            lr.step()
 
         if cnt % opt.report_steps == 0:
-            logger.info("Epoch={} iter={} lr={:.6f} train_ave_loss={:.6f} time={:.2f}s".format(
-                epoch, cnt, optimizer.param_groups[0]['lr'],
-                1.0 * loss.item() / n_tags, time.time() - start_time
-            ))
+            logger.info("Epoch={} iter={} lr={:.6f} train_ave_loss={:.6f} "
+                        "time={:.2f}s".format(epoch, cnt, optimizer.param_groups[0]['lr'],
+                                              loss.item(), time.time() - start_time))
             start_time = time.time()
 
         if cnt % opt.eval_steps == 0:
+            eval_time = time.time()
             valid_result = eval_model(model, valid_batch, ix2label, opt, opt.gold_valid_path)
             logger.info("Epoch={} iter={} lr={:.6f} train_loss={:.6f} valid_acc={:.6f}".format(
                 epoch, cnt, optimizer.param_groups[0]['lr'], total_loss, valid_result))
 
             if valid_result > best_valid:
+                witnessed_improved_valid_result = True
                 torch.save(model.state_dict(), os.path.join(opt.model, 'model.pkl'))
                 logger.info("New record achieved!")
                 best_valid = valid_result
@@ -482,8 +552,16 @@ def train_model(epoch: int,
                     test_result = eval_model(model, test_batch, ix2label, opt, opt.gold_test_path)
                     logger.info("Epoch={} iter={} lr={:.6f} test_acc={:.6f}".format(
                         epoch, cnt, optimizer.param_groups[0]['lr'], test_result))
+            eval_time = time.time() - eval_time
+            start_time += eval_time
 
-    return best_valid, test_result
+    logger.info("EndOfEpoch={} iter={} lr={:.6f} train_loss={:.6f}".format(
+        epoch, cnt, optimizer.param_groups[0]['lr'], total_loss))
+    logger.info("Time Tracker: input={:.2f}s | context={:.2f}s | classification={:.2f}s".format(
+        model.input_encoding_timer.total_eclipsed_time(),
+        model.context_encoding_timer.total_eclipsed_time(),
+        model.classification_timer.total_eclipsed_time()))
+    return best_valid, test_result, witnessed_improved_valid_result
 
 
 def train():
@@ -491,8 +569,6 @@ def train():
     cmd.add_argument('--seed', default=1, type=int, help='the random seed.')
     cmd.add_argument('--gpu', default=-1, type=int, help='use id of gpu, -1 if cpu.')
     cmd.add_argument('--config', required=True, help='the config file.')
-    cmd.add_argument('--optimizer', default='sgd', choices=['sgd', 'adam'],
-                     help='the type of optimizer: valid options=[sgd, adam]')
     cmd.add_argument('--train_path', required=True, help='the path to the training file.')
     cmd.add_argument('--valid_path', required=True, help='the path to the validation file.')
     cmd.add_argument('--test_path', required=False, help='the path to the testing file.')
@@ -500,13 +576,9 @@ def train():
     cmd.add_argument('--gold_test_path', type=str, help='the path to the testing file.')
     cmd.add_argument("--model", required=True, help="path to save model")
     cmd.add_argument("--batch_size", "--batch", type=int, default=32, help='the batch size.')
-    cmd.add_argument("--max_seg_len", default=10, help="the max length of segment.")
     cmd.add_argument("--max_epoch", type=int, default=100, help='the maximum number of iteration.')
     cmd.add_argument("--report_steps", type=int, default=1024, help='eval every x batches')
     cmd.add_argument("--eval_steps", type=int, help='eval every x batches')
-    cmd.add_argument("--lr", type=float, default=0.01, help='the learning rate.')
-    cmd.add_argument("--lr_decay", type=float, default=0, help='the learning rate decay.')
-    cmd.add_argument("--clip_grad", type=float, default=1, help='the tense of clipped grad.')
     cmd.add_argument('--output', help='The path to the output file.')
     cmd.add_argument("--script", required=True, help="The path to the evaluation script")
 
@@ -548,7 +620,9 @@ def train():
     for c in conf['input']:
         if c['type'] == 'embeddings':
             batcher = InputBatch(c['name'], c['field'], c['min_cut'],
-                                 c.get('oov', '<oov>'), c.get('pad', '<pad>'), not c.get('cased', True), use_cuda)
+                                 c.get('oov', '<oov>'), c.get('pad', '<pad>'),
+                                 not c.get('cased', True), c.get('normalize_digits', True),
+                                 use_cuda)
             if c['fixed']:
                 if 'pretrained' in c:
                     batcher.create_dict_from_file(c['pretrained'])
@@ -556,6 +630,12 @@ def train():
                     logger.warning('it is un-reasonable to use fix embedding without pretraining.')
             else:
                 batcher.create_dict_from_dataset(raw_training_data_)
+            input_batchers[c['name']] = batcher
+        elif c['type'] == 'cnn_encoder' or c['type'] == 'lstm_encoder':
+            batcher = CharacterBatch(c['name'], c['field'],
+                                     oov=c.get('oov', '<oov>'), pad=c.get('pad', '<pad>'), eow=c.get('eow', '<eow>'),
+                                     lower=not c.get('cased', True), use_cuda=use_cuda)
+            batcher.create_dict_from_dataset(raw_training_data_)
             input_batchers[c['name']] = batcher
 
     # till now, lexicon is fixed, but embeddings was not
@@ -574,9 +654,9 @@ def train():
     if use_cuda:
         model = model.cuda()
 
-    training_batcher = Batcher(raw_training_data_,
-                               input_batchers, head_batcher, relation_batcher,
-                               opt.batch_size, use_cuda=use_cuda)
+    training_batcher = BucketBatcher(raw_training_data_,
+                                     input_batchers, head_batcher, relation_batcher,
+                                     opt.batch_size, use_cuda=use_cuda)
 
     if opt.eval_steps is None or opt.eval_steps > len(raw_training_data_):
         opt.eval_steps = training_batcher.num_batches()
@@ -597,10 +677,38 @@ def train():
         test_batcher = None
 
     need_grad = lambda x: x.requires_grad
-    if opt.optimizer.lower() == 'adam':
-        optimizer = torch.optim.Adam(filter(need_grad, model.parameters()), lr=opt.lr)
+    c = conf['optimizer']
+    optimizer_name = c['type'].lower()
+    params = filter(need_grad, model.parameters())
+    if optimizer_name == 'adam':
+        optimizer = torch.optim.Adam(params, lr=c.get('lr', 1e-3), betas=c.get('betas', (0.9, 0.999)),
+                                     eps=c.get('eps', 1e-8))
+    elif optimizer_name == 'adamax':
+        optimizer = torch.optim.Adamax(params, lr=c.get('lr', 2e-3), betas=c.get('betas', (0.9, 0.999)),
+                                       eps=c.get('eps', 1e-8))
+    elif optimizer_name == 'sgd':
+        optimizer = torch.optim.SGD(params, lr=c.get('lr', 0.01), momentum=c.get('momentum', 0),
+                                    nesterov=c.get('nesterov', False))
+    elif optimizer_name == 'dense_sparse_adam':
+        optimizer = DenseSparseAdam(params, lr=c.get('lr', 1e-3), betas=c.get('betas', (0.9, 0.999)),
+                                    eps=c.get('eps', 1e-8))
+    elif optimizer_name == 'nadam':
+        optimizer = Nadam(params, lr=c.get('lr', 1e-3), betas=c.get('betas', (0.9, 0.999)), eps=c.get('eps', 1e-8))
     else:
-        optimizer = torch.optim.SGD(filter(need_grad, model.parameters()), lr=opt.lr)
+        raise ValueError('Unknown optimizer name: {0}'.format(optimizer_name))
+
+    if 'decay' in c:
+        if c['decay']['type'] == 'epoch':
+            lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer,
+                                                           c['decay']['step_size'] * training_batcher.num_batches(),
+                                                           c['decay']['gamma'])
+        elif c['decay']['type'] == 'instance':
+            lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, c['decay']['step_size'] // opt.batch_size,
+                                                           c['decay']['gamma'])
+        else:
+            raise ValueError('Unknown decay type: {}'.format(c['decay']['type']))
+    else:
+        lr_scheduler = None
 
     try:
         os.makedirs(opt.model)
@@ -626,12 +734,20 @@ def train():
     json.dump(vars(opt), codecs.open(os.path.join(opt.model, 'config.json'), 'w', encoding='utf-8'))
 
     best_valid, test_result = -1e8, -1e8
+    max_patience = c.get('patience', 10)
+    patience = 0
     for epoch in range(opt.max_epoch):
-        best_valid, test_result = train_model(epoch, opt, model, optimizer,
-                                              training_batcher, valid_batcher, test_batcher,
-                                              id2relation, best_valid, test_result)
-        if opt.lr_decay > 0:
-            optimizer.param_groups[0]['lr'] *= opt.lr_decay
+        best_valid, test_result, improved = train_model(epoch, opt, conf, model, optimizer, lr_scheduler,
+                                                        training_batcher, valid_batcher, test_batcher,
+                                                        id2relation, best_valid, test_result)
+
+        if not improved:
+            patience += 1
+            if patience == max_patience:
+                logger.info('Max patience is reached, stop training.')
+                break
+        else:
+            patience = 0
 
     logger.info("best_valid_acc: {:.6f}".format(best_valid))
     logger.info("test_acc: {:.6f}".format(test_result))
@@ -664,9 +780,22 @@ def test():
     for c in conf['input']:
         if c['type'] == 'embeddings':
             name = c['name']
-            batcher = InputBatch(c['name'], c['field'], c['min_cut'],
-                                 c.get('oov', '<oov>'), c.get('pad', '<pad>'), not c.get('cased', True), use_cuda)
-            with open(os.path.join(model_path, '{0}.dic'.format(c['name'])), 'r') as fpi:
+            batcher = InputBatch(name, c['field'], c['min_cut'],
+                                 c.get('oov', '<oov>'), c.get('pad', '<pad>'),
+                                 not c.get('cased', True), c.get('normalize_digits', True), use_cuda)
+            with open(os.path.join(model_path, '{0}.dic'.format(name)), 'r') as fpi:
+                mapping = batcher.mapping
+                for line in fpi:
+                    token, i = line.strip().split('\t')
+                    mapping[token] = int(i)
+            input_batchers[name] = batcher
+
+        elif c['type'] == 'cnn_encoder' or c['type'] == 'lstm_encoder':
+            name = c['name']
+            batcher = CharacterBatch(name, c['field'],
+                                     oov=c.get('oov', '<oov>'), pad=c.get('pad', '<pad>'), eow=c.get('eow', '<eow>'),
+                                     lower=not c.get('cased', True), use_cuda=use_cuda)
+            with open(os.path.join(model_path, '{0}.dic'.format(name)), 'r') as fpi:
                 mapping = batcher.mapping
                 for line in fpi:
                     token, i = line.strip().split('\t')
@@ -728,9 +857,8 @@ def test():
         orders.extend(order)
 
     for order in orders:
-        for head, tag in results[order]:
-            head, tag = head.item(), tag.item()
-            print('{0}\t_\t_\t_\t_\t_{1}\t{2}_\t_'.format(i + 1, head, ix2label[tag]), file=fpo)
+        for i, (head, tag) in enumerate(results[order]):
+            print('{0}\t_\t_\t_\t_\t_\t{1}\t{2}\t_\t_'.format(i + 1, head, id2label[tag]), file=fpo)
         print(file=fpo)
     fpo.close()
 

@@ -3,21 +3,22 @@ import logging
 import codecs
 import gzip
 import numpy as np
-from .input_layer_base import InputLayerBase
+from .input_embed_base import InputEmbedderBase
 logger = logging.getLogger(__name__)
 
 
-class EmbeddingLayer(InputLayerBase):
+class Embeddings(InputEmbedderBase):
     def __init__(self, input_field_name,
                  n_d, word2id, embs=None, fix_emb=True, oov='<oov>', pad='<pad>', normalize=False):
-        super(EmbeddingLayer, self).__init__(input_field_name)
+        super(Embeddings, self).__init__(input_field_name)
         self.word2id = word2id
         self.id2word = {i: word for word, i in word2id.items()}
         self.n_V, self.n_d = len(word2id), n_d
         self.oovid = word2id[oov]
         self.padid = word2id[pad]
         self.embedding = torch.nn.Embedding(self.n_V, n_d, padding_idx=self.padid)
-        self.embedding.weight.data.uniform_(-0.25, 0.25)
+        scale = np.sqrt(3.0 / n_d)
+        self.embedding.weight.data.uniform_(-scale, scale)
 
         if embs is not None:
             emb_words, emb_vecs = embs
@@ -41,7 +42,7 @@ class EmbeddingLayer(InputLayerBase):
     def forward(self, input_):
         return self.embedding(input_)
 
-    def encoding_dim(self):
+    def get_embed_dim(self):
         return self.n_d
 
 

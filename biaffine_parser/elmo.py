@@ -3,11 +3,11 @@ from typing import List
 import torch
 import h5py
 import logging
-from biaffine_parser.input_layer_base import InputLayerBase
+from biaffine_parser.input_embed_base import InputEmbedderBase
 logger = logging.getLogger(__name__)
 
 
-class ContextualizedWordEmbeddings(InputLayerBase):
+class ContextualizedWordEmbeddings(InputEmbedderBase):
     def __init__(self, input_field_name, lexicon_path, use_cuda):
         super(ContextualizedWordEmbeddings, self).__init__(input_field_name)
         self.use_cuda = use_cuda
@@ -42,7 +42,7 @@ class ContextualizedWordEmbeddings(InputLayerBase):
         # output_: (batch_size, seq_len, max_seg_len, dim)
         return encoding_
 
-    def encoding_dim(self):
+    def get_embed_dim(self):
         return self.dim
 
 
@@ -57,7 +57,7 @@ if __name__ == "__main__":
 
     encoder = ContextualizedWordEmbeddings(sys.argv[1], False)
     print(encoder)
-    print(encoder.encoding_dim())
+    print(encoder.get_embed_dim())
 
     input_ = [
         ['EU', 'rejects', 'German', 'call', 'to', 'boycott', 'British', 'lamb', '.'],
