@@ -204,6 +204,7 @@ class BiaffineParser(torch.nn.Module):
                 encoded_input.append(encoder_(args_))
 
             encoded_input = torch.cat(encoded_input, dim=-1)
+            encoded_input = self.input_dropout_(encoded_input)
             # encoded_input: (batch_size, seq_len, input_dim)
 
         with self.context_encoding_timer as _:
@@ -212,13 +213,15 @@ class BiaffineParser(torch.nn.Module):
 
             context_encoded_input = self.encoder(encoded_input, mask)
             # context_encoded_input: (batch_size, seq_len, encoded_dim)
-
-            batch_size, _, encoding_dim = context_encoded_input.size()
+            context_encoded_input = self.dropout_(context_encoded_input)
 
             # handle the sentinel/dummy root.
+            batch_size, _, encoding_dim = context_encoded_input.size()
             head_sentinel = self.head_sentinel_.expand(batch_size, 1, encoding_dim)
             context_encoded_input = torch.cat([head_sentinel, context_encoded_input], 1)
             # context_encoded_input: (batch_size, seq_len + 1, encoded_dim)
+
+        with self.classification_timer as _:
             mask = torch.cat([mask.new_ones(batch_size, 1), mask], 1)
             # mask: (batch_size, seq_len + 1)
 
@@ -227,17 +230,14 @@ class BiaffineParser(torch.nn.Module):
             if head_tags is not None:
                 head_tags = torch.cat([head_tags.new_zeros(batch_size, 1), head_tags], 1)
             float_mask = mask.float()
-            context_encoded_input = self.input_dropout_(context_encoded_input)
 
-        with self.classification_timer as _:
             head_arc_representation = self.head_arc_feedforward(context_encoded_input)
             child_arc_representation = self.child_arc_feedforward(context_encoded_input)
 
             head_tag_representation = self.head_tag_feedforward(context_encoded_input)
             child_tag_representation = self.child_tag_feedforward(context_encoded_input)
 
-            # head_arc_representation / child_arc_representation
-            # head_tag_representation / child_tag_representation: (batch_size, seq_len + 1, encoded_dim)
+            # head_tag_representation / child_tag_representation: (batch_size, seq_len + 1, dim)
             arc_representation = self.dropout_(torch.cat([head_arc_representation, child_arc_representation], dim=1))
             tag_representation = self.dropout_(torch.cat([head_tag_representation, child_tag_representation], dim=1))
 
