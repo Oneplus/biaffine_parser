@@ -250,10 +250,6 @@ class BiaffineParser(torch.nn.Module):
             # attended_arcs: (batch_size, seq_len + 1, seq_len + 1)
             attended_arcs = self.arc_attention(head_arc_representation, child_arc_representation)
 
-            minus_inf = -1e8
-            minus_mask = (1 - float_mask) * minus_inf
-            attended_arcs = attended_arcs + minus_mask.unsqueeze(2) + minus_mask.unsqueeze(1)
-
             if not self.training:
                 if not self.use_mst_decoding_for_validation:
                     predicted_heads, predicted_head_tags = self._greedy_decode(head_tag_representation,
@@ -395,6 +391,11 @@ class BiaffineParser(torch.nn.Module):
                         head_tags: torch.Tensor,
                         mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         float_mask = mask.float()
+
+        minus_inf = -1e8
+        minus_mask = (1 - float_mask) * minus_inf
+        attended_arcs = attended_arcs + minus_mask.unsqueeze(2) + minus_mask.unsqueeze(1)
+
         batch_size, sequence_length, _ = attended_arcs.size()
         # shape (batch_size, 1)
         range_vector = get_range_vector(batch_size, get_device_of(attended_arcs)).unsqueeze(1)
