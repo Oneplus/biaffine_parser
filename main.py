@@ -186,6 +186,15 @@ class BiaffineParser(torch.nn.Module):
         self.context_encoding_timer = TimeRecoder()
         self.classification_timer = TimeRecoder()
 
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for feedforward in [self.head_arc_feedforward, self.head_tag_feedforward,
+                            self.child_arc_feedforward, self.child_tag_feedforward]:
+            for layer in feedforward._linear_layers:
+                torch.nn.init.xavier_uniform_(layer.weight.data)
+                layer.bias.data.fill_(0.)
+
     def forward(self, inputs: Dict[str, Any],
                 head_tags: torch.LongTensor = None,
                 head_indices: torch.LongTensor = None):
@@ -229,7 +238,6 @@ class BiaffineParser(torch.nn.Module):
                 head_indices = torch.cat([head_indices.new_zeros(batch_size, 1), head_indices], 1)
             if head_tags is not None:
                 head_tags = torch.cat([head_tags.new_zeros(batch_size, 1), head_tags], 1)
-            float_mask = mask.float()
 
             head_arc_representation = self.head_arc_feedforward(context_encoded_input)
             child_arc_representation = self.child_arc_feedforward(context_encoded_input)
@@ -400,12 +408,13 @@ class BiaffineParser(torch.nn.Module):
         # shape (batch_size, 1)
         range_vector = get_range_vector(batch_size, get_device_of(attended_arcs)).unsqueeze(1)
         # shape (batch_size, sequence_length, sequence_length)
-        normalised_arc_logits = torch.nn.functional.log_softmax(
-            attended_arcs, dim=-1) * float_mask.unsqueeze(2) * float_mask.unsqueeze(1)
+        normalised_arc_logits = masked_log_softmax(attended_arcs,
+                                                   mask) * float_mask.unsqueeze(2) * float_mask.unsqueeze(1)
 
         # shape (batch_size, sequence_length, num_head_tags)
         head_tag_logits = self._get_head_tags(head_tag_representation, child_tag_representation, head_indices)
-        normalised_head_tag_logits = torch.nn.functional.log_softmax(head_tag_logits, dim=-1) * float_mask.unsqueeze(-1)
+        normalised_head_tag_logits = masked_log_softmax(head_tag_logits,
+                                                        mask.unsqueeze(-1)) * float_mask.unsqueeze(-1)
         # index matrix with shape (batch, sequence_length)
         timestep_index = get_range_vector(sequence_length, get_device_of(attended_arcs))
         child_index = timestep_index.view(1, sequence_length).expand(batch_size, sequence_length).long()
@@ -499,7 +508,6 @@ def train_model(epoch: int,
                 conf: Dict,
                 model: BiaffineParser,
                 optimizer: torch.optim.Optimizer,
-                lr: torch.optim.lr_scheduler.StepLR,
                 train_batch: BatcherBase,
                 valid_batch: Batcher,
                 test_batch: Batcher,
@@ -528,8 +536,6 @@ def train_model(epoch: int,
             torch.nn.utils.clip_grad_norm_(model.parameters(), conf['optimizer']['clip_grad'])
 
         optimizer.step()
-        if lr:
-            lr.step()
 
         if cnt % opt.report_steps == 0:
             logger.info("Epoch={} iter={} lr={:.6f} train_ave_loss={:.6f} "
@@ -676,10 +682,9 @@ def train():
     else:
         test_batcher = None
 
-    need_grad = lambda x: x.requires_grad
     c = conf['optimizer']
     optimizer_name = c['type'].lower()
-    params = filter(need_grad, model.parameters())
+    params = filter(lambda param: param.requires_grad, model.parameters())
     if optimizer_name == 'adam':
         optimizer = torch.optim.Adam(params, lr=c.get('lr', 1e-3), betas=c.get('betas', (0.9, 0.999)),
                                      eps=c.get('eps', 1e-8))
@@ -696,19 +701,6 @@ def train():
         optimizer = Nadam(params, lr=c.get('lr', 1e-3), betas=c.get('betas', (0.9, 0.999)), eps=c.get('eps', 1e-8))
     else:
         raise ValueError('Unknown optimizer name: {0}'.format(optimizer_name))
-
-    if 'decay' in c:
-        if c['decay']['type'] == 'epoch':
-            lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer,
-                                                           c['decay']['step_size'] * training_batcher.num_batches(),
-                                                           c['decay']['gamma'])
-        elif c['decay']['type'] == 'instance':
-            lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, c['decay']['step_size'] // opt.batch_size,
-                                                           c['decay']['gamma'])
-        else:
-            raise ValueError('Unknown decay type: {}'.format(c['decay']['type']))
-    else:
-        lr_scheduler = None
 
     try:
         os.makedirs(opt.model)
@@ -734,18 +726,26 @@ def train():
     json.dump(vars(opt), codecs.open(os.path.join(opt.model, 'config.json'), 'w', encoding='utf-8'))
 
     best_valid, test_result = -1e8, -1e8
-    max_patience = c.get('patience', 10)
+    max_decay_times = c.get('max_decay_times', 5)
+    max_patience = c.get('max_patience', 10)
     patience = 0
+    decay_times = 0
+    decay_rate = c.get('decay_rate', 0.5)
     for epoch in range(opt.max_epoch):
-        best_valid, test_result, improved = train_model(epoch, opt, conf, model, optimizer, lr_scheduler,
+        best_valid, test_result, improved = train_model(epoch, opt, conf, model, optimizer,
                                                         training_batcher, valid_batcher, test_batcher,
                                                         id2relation, best_valid, test_result)
 
         if not improved:
             patience += 1
             if patience == max_patience:
-                logger.info('Max patience is reached, stop training.')
-                break
+                decay_times += 1
+                if decay_times == max_decay_times:
+                    break
+
+                optimizer.param_groups[0]['lr'] *= decay_rate
+                patience = 0
+                logger.info('Max patience is reached, decay learning rate to {0}'.format(optimizer))
         else:
             patience = 0
 
