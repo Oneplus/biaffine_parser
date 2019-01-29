@@ -487,8 +487,8 @@ def eval_model(model: BiaffineParser,
             results.append(result)
         orders.extend(order)
 
-    for order in orders:
-        for i, (head, tag) in enumerate(results[order]):
+    for _, result in sorted(list(enumerate(results)), key=lambda p: orders[p[0]]):
+        for i, (head, tag) in enumerate(result):
             print('{0}\t_\t_\t_\t_\t_\t{1}\t{2}\t_\t_'.format(i + 1, head, ix2label[tag]), file=fpo)
         print(file=fpo)
     fpo.close()
@@ -857,8 +857,8 @@ def test():
             logger.info('finished {0} x {1} batches'.format(cnt, model_cmd_opt.batch_size))
         orders.extend(order)
 
-    for order in orders:
-        for i, (head, tag) in enumerate(results[order]):
+    for _, result in sorted(list(enumerate(results)), key=lambda p: orders[p[0]]):
+        for i, (head, tag) in enumerate(result):
             print('{0}\t_\t_\t_\t_\t_\t{1}\t{2}\t_\t_'.format(i + 1, head, id2label[tag]), file=fpo)
         print(file=fpo)
     fpo.close()
