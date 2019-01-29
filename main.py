@@ -400,13 +400,12 @@ class BiaffineParser(torch.nn.Module):
         # shape (batch_size, 1)
         range_vector = get_range_vector(batch_size, get_device_of(attended_arcs)).unsqueeze(1)
         # shape (batch_size, sequence_length, sequence_length)
-        normalised_arc_logits = masked_log_softmax(attended_arcs,
-                                                   mask) * float_mask.unsqueeze(2) * float_mask.unsqueeze(1)
+        normalised_arc_logits = torch.nn.functional.log_softmax(
+            attended_arcs, dim=-1) * float_mask.unsqueeze(2) * float_mask.unsqueeze(1)
 
         # shape (batch_size, sequence_length, num_head_tags)
         head_tag_logits = self._get_head_tags(head_tag_representation, child_tag_representation, head_indices)
-        normalised_head_tag_logits = masked_log_softmax(head_tag_logits,
-                                                        mask.unsqueeze(-1)) * float_mask.unsqueeze(-1)
+        normalised_head_tag_logits = torch.nn.functional.log_softmax(head_tag_logits, dim=-1) * float_mask.unsqueeze(-1)
         # index matrix with shape (batch, sequence_length)
         timestep_index = get_range_vector(sequence_length, get_device_of(attended_arcs))
         child_index = timestep_index.view(1, sequence_length).expand(batch_size, sequence_length).long()
