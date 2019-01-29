@@ -225,7 +225,46 @@ class CharacterBatch(InputBatchBase):
 
 
 class BatcherBase(object):
-    pass
+    def __init__(self, raw_dataset_: List[List[List[str]]],
+                 input_batchers_: Dict[str, InputBatchBase],
+                 head_batcher_: HeadBatch,
+                 relation_batcher_: RelationBatch,
+                 batch_size: int,
+                 use_cuda: bool):
+        self.raw_dataset_ = raw_dataset_
+        self.input_batchers_ = input_batchers_
+        self.head_batcher_ = head_batcher_
+        self.relation_batcher_ = relation_batcher_
+        self.batch_size = batch_size
+        self.use_cuda = use_cuda
+
+        self.batch_indices = []
+
+    def reset_batch_indices(self):
+        raise NotImplementedError
+
+    def get(self):
+        self.reset_batch_indices()
+
+        for one_batch_indices in self.batch_indices:
+            data_in_one_batch = [self.raw_dataset_[i] for i in one_batch_indices]
+
+            seq_len = max([len(data) for data in data_in_one_batch])
+            head_batch_ = self.head_batcher_.create_one_batch(len(data_in_one_batch), seq_len, data_in_one_batch)
+            relation_batch_ = self.relation_batcher_.create_one_batch(len(data_in_one_batch), seq_len,
+                                                                      data_in_one_batch)
+
+            input_batches_ = {}
+            for name_, input_batcher_ in self.input_batchers_.items():
+                input_batches_[name_] = input_batcher_.create_one_batch(data_in_one_batch)
+
+            yield input_batches_, head_batch_, relation_batch_, one_batch_indices
+
+    def num_batches(self):
+        if len(self.batch_indices) == 0:
+            self.reset_batch_indices()
+
+        return len(self.batch_indices)
 
 
 class Batcher(BatcherBase):
@@ -238,18 +277,13 @@ class Batcher(BatcherBase):
                  sorting: bool = True,
                  keep_full: bool = False,
                  use_cuda: bool = False):
-        self.raw_dataset_ = raw_dataset_
-        self.input_batchers_ = input_batchers_
-        self.head_batcher_ = head_batcher_
-        self.relation_batcher_ = relation_batcher_
-
-        self.batch_size = batch_size
+        super(Batcher, self).__init__(raw_dataset_, input_batchers_, head_batcher_, relation_batcher_,
+                                      batch_size, use_cuda)
         self.shuffle = shuffle
         self.sorting = sorting
         self.keep_full = keep_full
-        self.use_cuda = use_cuda
 
-    def get(self):
+    def reset_batch_indices(self):
         n_inputs = len(self.raw_dataset_)
         new_orders = list(range(n_inputs))
         if self.shuffle:
@@ -264,7 +298,7 @@ class Batcher(BatcherBase):
             orders[o] = i
 
         start_id = 0
-        batch_indices = []
+        self.batch_indices = []
         while start_id < n_inputs:
             end_id = start_id + self.batch_size
             if end_id > n_inputs:
@@ -274,29 +308,14 @@ class Batcher(BatcherBase):
                 end_id = start_id + 1
                 while end_id < n_inputs and len(sorted_raw_dataset[end_id]) == len(sorted_raw_dataset[start_id]):
                     end_id += 1
-            batch_indices.append((start_id, end_id))
+
+            one_batch_indices = [orders[o] for o in range(start_id, end_id)]
+            if len(one_batch_indices) > 0:
+                self.batch_indices.append(one_batch_indices)
             start_id = end_id
 
         if self.shuffle:
-            random.shuffle(batch_indices)
-
-        for start_id, end_id in batch_indices:
-            seq_len = max([len(sorted_raw_data) for sorted_raw_data in sorted_raw_dataset[start_id: end_id]])
-            head_batch_ = self.head_batcher_.create_one_batch(end_id - start_id, seq_len,
-                                                              sorted_raw_dataset[start_id: end_id])
-            relation_batch_ = self.relation_batcher_.create_one_batch(end_id - start_id, seq_len,
-                                                                      sorted_raw_dataset[start_id: end_id])
-
-            input_batches_ = {}
-            for name_, input_batcher_ in self.input_batchers_.items():
-                input_batches_[name_] = input_batcher_.create_one_batch(
-                    sorted_raw_dataset[start_id: end_id])
-
-            yield input_batches_, head_batch_, relation_batch_, orders[start_id: end_id]
-
-    def num_batches(self):
-        n_inputs_ = len(self.raw_dataset_)
-        return n_inputs_ // self.batch_size + 1
+            random.shuffle(self.batch_indices)
 
 
 class BucketBatcher(BatcherBase):
@@ -309,15 +328,10 @@ class BucketBatcher(BatcherBase):
                  relation_batcher_: RelationBatch,
                  batch_size: int,
                  use_cuda: bool = False):
-        self.raw_dataset_ = raw_dataset_
-        self.input_batchers_ = input_batchers_
-        self.head_batcher_ = head_batcher_
-        self.relation_batcher_ = relation_batcher_
+        super(BucketBatcher, self).__init__(raw_dataset_, input_batchers_, head_batcher_, relation_batcher_,
+                                            batch_size, use_cuda)
 
-        self.batch_size = batch_size
-        self.use_cuda = use_cuda
-
-    def get(self):
+    def reset_batch_indices(self):
         buckets = [[] for _ in self._buckets]
 
         for data_id, data in enumerate(self.raw_dataset_):
@@ -329,39 +343,28 @@ class BucketBatcher(BatcherBase):
 
         random.shuffle(buckets)
         bucket_id = 0
-        orders = []
+        one_batch_indices = []
         bucket = buckets[bucket_id]
         random.shuffle(bucket)
         data_id_in_bucket = 0
 
+        self.batch_indices = []
         while bucket_id < len(buckets):
-            while len(orders) < self.batch_size:
-                orders.append(bucket[data_id_in_bucket])
+            while len(one_batch_indices) < self.batch_size:
+                one_batch_indices.append(bucket[data_id_in_bucket])
 
                 data_id_in_bucket += 1
                 if data_id_in_bucket == len(bucket):
+                    # move to the next bucket
                     bucket_id += 1
-                    if bucket_id == len(buckets):
-                        break
-                    data_id_in_bucket = 0
-                    bucket = buckets[bucket_id]
-                    random.shuffle(bucket)
+                    if bucket_id < len(buckets):
+                        data_id_in_bucket = 0
+                        bucket = buckets[bucket_id]
+                        random.shuffle(bucket)
+                    # stop pushing data to the batch, even if this batch is not full.
+                    break
+            if len(one_batch_indices) > 0:
+                self.batch_indices.append(one_batch_indices)
+            one_batch_indices = []
 
-            data_in_one_batch = [self.raw_dataset_[i] for i in orders]
-
-            seq_len = max([len(data) for data in data_in_one_batch])
-            head_batch_ = self.head_batcher_.create_one_batch(len(data_in_one_batch), seq_len, data_in_one_batch)
-            relation_batch_ = self.relation_batcher_.create_one_batch(len(data_in_one_batch), seq_len,
-                                                                      data_in_one_batch)
-
-            input_batches_ = {}
-            for name_, input_batcher_ in self.input_batchers_.items():
-                input_batches_[name_] = input_batcher_.create_one_batch(data_in_one_batch)
-
-            yield input_batches_, head_batch_, relation_batch_, orders
-
-            orders = []
-
-    def num_batches(self):
-        n_inputs_ = len(self.raw_dataset_)
-        return n_inputs_ // self.batch_size + 1
+        random.shuffle(self.batch_indices)

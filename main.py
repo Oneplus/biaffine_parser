@@ -745,7 +745,8 @@ def train():
 
                 optimizer.param_groups[0]['lr'] *= decay_rate
                 patience = 0
-                logger.info('Max patience is reached, decay learning rate to {0}'.format(optimizer))
+                logger.info('Max patience is reached, decay learning rate to '
+                            '{0}'.format(optimizer.param_groups[0]['lr']))
         else:
             patience = 0
 
