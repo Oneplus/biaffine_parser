@@ -517,20 +517,29 @@ def train_model(epoch: int,
     model.reset_timer()
     model.train()
 
-    total_loss, total_tag = 0.0, 0
     cnt = 0
     start_time = time.time()
 
     witnessed_improved_valid_result = False
+    report_loss, report_arc_loss, report_tag_loss, report_n_tags = 0., 0., 0., 0.
+    total_loss, total_arc_loss, total_tag_loss, total_n_tags = 0., 0., 0., 0.
     for inputs, head_indices, head_tags, _ in train_batch.get():
         cnt += 1
         model.zero_grad()
         forward_output_dict = model.forward(inputs, head_tags, head_indices)
-        loss = forward_output_dict['loss']
 
         n_tags = inputs['length'].sum().item()
+        loss = forward_output_dict['loss']
+        report_loss += loss.item()
+        report_arc_loss += forward_output_dict['arc_loss'].item()
+        report_tag_loss += forward_output_dict['tag_loss'].item()
+        report_n_tags += n_tags
+
         total_loss += loss.item() * n_tags
-        total_tag += n_tags
+        total_arc_loss += forward_output_dict['arc_loss'].item() * n_tags
+        total_tag_loss += forward_output_dict['tag_loss'].item() * n_tags
+        total_n_tags += n_tags
+
         loss.backward()
         if 'clip_grad' in conf['optimizer']:
             torch.nn.utils.clip_grad_norm_(model.parameters(), conf['optimizer']['clip_grad'])
@@ -538,16 +547,21 @@ def train_model(epoch: int,
         optimizer.step()
 
         if cnt % opt.report_steps == 0:
-            logger.info("Epoch={} iter={} lr={:.6f} train_ave_loss={:.6f} "
+            logger.info("Epoch={} iter={} lr={:.6f} loss={:.4f} (arc={:.4f}, rel={:.4f}) "
                         "time={:.2f}s".format(epoch, cnt, optimizer.param_groups[0]['lr'],
-                                              loss.item(), time.time() - start_time))
+                                              report_loss / report_n_tags,
+                                              report_arc_loss / report_n_tags,
+                                              report_tag_loss / report_n_tags,
+                                              time.time() - start_time))
             start_time = time.time()
+            report_loss, report_arc_loss, report_tag_loss, report_n_tags = 0., 0., 0., 0.
 
         if cnt % opt.eval_steps == 0:
             eval_time = time.time()
             valid_result = eval_model(model, valid_batch, ix2label, opt, opt.gold_valid_path)
-            logger.info("Epoch={} iter={} lr={:.6f} train_loss={:.6f} valid_acc={:.6f}".format(
-                epoch, cnt, optimizer.param_groups[0]['lr'], total_loss, valid_result))
+            logger.info("Epoch={} iter={} lr={:.6f} loss={:.4f} (arc={:.4f}, rel={:.4f}) valid_acc={:.6f}".format(
+                epoch, cnt, optimizer.param_groups[0]['lr'],
+                total_loss, total_arc_loss, total_tag_loss, valid_result))
 
             if valid_result > best_valid:
                 witnessed_improved_valid_result = True
@@ -561,8 +575,8 @@ def train_model(epoch: int,
             eval_time = time.time() - eval_time
             start_time += eval_time
 
-    logger.info("EndOfEpoch={} iter={} lr={:.6f} train_loss={:.6f}".format(
-        epoch, cnt, optimizer.param_groups[0]['lr'], total_loss))
+    logger.info("EndOfEpoch={} iter={} lr={:.6f} loss={:.4f} (arc={:.4f}, rel={:.4f}) ".format(
+        epoch, cnt, optimizer.param_groups[0]['lr'], total_loss, total_arc_loss, total_tag_loss))
     logger.info("Time Tracker: input={:.2f}s | context={:.2f}s | classification={:.2f}s".format(
         model.input_encoding_timer.total_eclipsed_time(),
         model.context_encoding_timer.total_eclipsed_time(),
@@ -629,10 +643,10 @@ def train():
                                  c.get('oov', '<oov>'), c.get('pad', '<pad>'),
                                  not c.get('cased', True), c.get('normalize_digits', True),
                                  use_cuda)
+            if 'pretrained' in c:
+                batcher.create_dict_from_file(c['pretrained'])
             if c['fixed']:
-                if 'pretrained' in c:
-                    batcher.create_dict_from_file(c['pretrained'])
-                else:
+                if not 'pretrained' in c:
                     logger.warning('it is un-reasonable to use fix embedding without pretraining.')
             else:
                 batcher.create_dict_from_dataset(raw_training_data_)

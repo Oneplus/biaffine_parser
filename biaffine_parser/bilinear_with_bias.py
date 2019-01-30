@@ -26,6 +26,6 @@ class BilinearWithBias(torch.nn.Module):
         return self.bilinear_(input1, input2) + self.linear1_(input1) + self.linear2_(input2)
 
     def extra_repr(self):
-        return 'in1_features={}, in2_features={}, out_features={}, bias={}'.format(
-            self.in1_features, self.in2_features, self.out_features, self.bias is not None
+        return 'in1_features={}, in2_features={}, out_features={}'.format(
+            self.in1_features, self.in2_features, self.out_features
         )

@@ -38,6 +38,8 @@ class Embeddings(InputEmbedderBase):
 
         if fix_emb:
             self.embedding.weight.requires_grad = False
+            self.embedding.weight.data[self.oovid].fill_(0)
+            self.embedding.weight.data[self.padid].fill_(0)
 
     def forward(self, input_):
         return self.embedding(input_)
