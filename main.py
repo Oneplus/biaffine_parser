@@ -27,6 +27,7 @@ from biaffine_parser.cnn_token_encoder import ConvTokenEmbedder
 from biaffine_parser.elmo import ContextualizedWordEmbeddings
 from biaffine_parser.sum_input_encoder import AffineTransformInputEncoder, SummationInputEncoder
 from biaffine_parser.concat_input_encoder import ConcatenateInputEncoder
+from biaffine_parser.dummy_ctx_encoder import DummyContextEncoder
 from biaffine_parser.nadam import Nadam
 from biaffine_parser.partial_bilinear_matrix_attention import PartialBilinearMatrixAttention, BilinearMatrixAttentionV2
 from biaffine_parser.stacked_bidirectional_lstm import StackedBidirectionalLstmDozat
@@ -159,15 +160,26 @@ class BiaffineParser(torch.nn.Module):
                 StackedBidirectionalLstmDozat(num_layers=c['num_layers'],
                                               input_size=input_dim,
                                               hidden_size=c['hidden_dim'],
-                                              recurrent_dropout_probability=c['recurrent_dropout_probability']),
+                                              recurrent_dropout_probability=c['recurrent_dropout_probability'],
+                                              activation=Activation.by_name("leaky_relu")()),
                 stateful=False)
-        else:
+        elif c['type'] == 'stacked_bidirectional_lstm_ma':
+            self.encoder = PytorchSeq2SeqWrapper(
+                StackedBidirectionalLstmDozat(num_layers=c['num_layers'],
+                                              input_size=input_dim,
+                                              hidden_size=c['hidden_dim'],
+                                              recurrent_dropout_probability=c['recurrent_dropout_probability'],
+                                              activation=Activation.by_name("tanh")()),
+                stateful=False)
+        elif c['type'] == 'stacked_bidirectional_lstm':
             self.encoder = PytorchSeq2SeqWrapper(
                 StackedBidirectionalLstm(num_layers=c['num_layers'],
                                          input_size=input_dim,
                                          hidden_size=c['hidden_dim'],
                                          recurrent_dropout_probability=c['recurrent_dropout_probability']),
                 stateful=False)
+        else:
+            self.encoder = DummyContextEncoder()
 
         encoder_dim = self.encoder.get_output_dim()
         c = conf['biaffine_parser']
@@ -585,7 +597,8 @@ def train_model(epoch: int,
             start_time += eval_time
 
     logger.info("EndOfEpoch={} iter={} lr={:.6f} loss={:.4f} (arc={:.4f}, rel={:.4f}) ".format(
-        epoch, cnt, optimizer.param_groups[0]['lr'], total_loss, total_arc_loss, total_tag_loss))
+        epoch, cnt, optimizer.param_groups[0]['lr'],
+        total_loss / total_n_tags, total_arc_loss / total_n_tags, total_tag_loss / total_n_tags))
     logger.info("Time Tracker: input={:.2f}s | context={:.2f}s | classification={:.2f}s".format(
         model.input_encoding_timer.total_eclipsed_time(),
         model.context_encoding_timer.total_eclipsed_time(),

@@ -3,6 +3,7 @@ import torch
 from torch.nn.utils.rnn import PackedSequence, pack_padded_sequence, pad_packed_sequence
 from allennlp.common.checks import ConfigurationError
 from allennlp.nn.initializers import block_orthogonal
+from allennlp.nn.activations import Activation
 
 
 def get_dropout_mask(dropout_probability: float,
@@ -18,6 +19,7 @@ class DozatLstmCell(torch.nn.Module):
     def __init__(self,
                  input_size: int,
                  hidden_size: int,
+                 activation: Activation,
                  go_forward: bool = True) -> None:
         super(DozatLstmCell, self).__init__()
         # Required to be wrapped with a :class:`PytorchSeq2SeqWrapper`.
@@ -25,6 +27,7 @@ class DozatLstmCell(torch.nn.Module):
         self.hidden_size = hidden_size
 
         self.go_forward = go_forward
+        self.activation = activation
 
         # We do the projections for all the gates all at once, so if we are
         # using highway layers, we need some extra projections, which is
@@ -38,6 +41,7 @@ class DozatLstmCell(torch.nn.Module):
         block_orthogonal(self.input_linearity.weight.data, [self.hidden_size, self.input_size])
         block_orthogonal(self.state_linearity.weight.data, [self.hidden_size, self.hidden_size])
 
+        self.input_linearity.bias.data.fill_(0.0)
         self.state_linearity.bias.data.fill_(0.0)
         # Initialize forget gate biases to 1.0 as per An Empirical
         # Exploration of Recurrent Network Architectures, (Jozefowicz, 2015).
@@ -101,7 +105,7 @@ class DozatLstmCell(torch.nn.Module):
                                         projected_state[:, 3 * self.hidden_size:4 * self.hidden_size])
             memory = input_gate * memory_init + forget_gate * previous_memory
             #
-            timestep_output = output_gate * torch.nn.functional.leaky_relu(memory)
+            timestep_output = output_gate * self.activation(memory)
 
             # Only do dropout if the dropout prob is > 0.0 and we are in training mode.
             if recurrent_dropout_mask is not None and self.training:
@@ -130,6 +134,7 @@ class StackedBidirectionalLstmDozat(torch.nn.Module):
                  input_size: int,
                  hidden_size: int,
                  num_layers: int,
+                 activation: Activation,
                  recurrent_dropout_probability: float = 0.0) -> None:
         super(StackedBidirectionalLstmDozat, self).__init__()
 
@@ -144,8 +149,8 @@ class StackedBidirectionalLstmDozat(torch.nn.Module):
         lstm_input_size = input_size
         for layer_index in range(num_layers):
 
-            forward_layer = DozatLstmCell(lstm_input_size, hidden_size, go_forward=True)
-            backward_layer = DozatLstmCell(lstm_input_size, hidden_size, go_forward=False)
+            forward_layer = DozatLstmCell(lstm_input_size, hidden_size, activation=activation, go_forward=True)
+            backward_layer = DozatLstmCell(lstm_input_size, hidden_size, activation=activation, go_forward=False)
 
             lstm_input_size = hidden_size * 2
             self.add_module('forward_layer_{}'.format(layer_index), forward_layer)
