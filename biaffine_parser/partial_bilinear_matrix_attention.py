@@ -54,3 +54,47 @@ class PartialBilinearMatrixAttention(MatrixAttention):
         intermediate = torch.matmul(matrix_1.unsqueeze(1), weight)
         final = torch.matmul(intermediate, matrix_2.unsqueeze(1).transpose(2, 3))
         return self._activation(final.squeeze(1) + self._bias)
+
+
+class BilinearMatrixAttentionV2(MatrixAttention):
+    def __init__(self,
+                 matrix_1_dim: int,
+                 matrix_2_dim: int,
+                 activation: Activation = None,
+                 use_input_biases: bool = False,
+                 label_dim: int = 1) -> None:
+        super(BilinearMatrixAttentionV2, self).__init__()
+
+        if label_dim == 1:
+            self._weight_matrix = torch.nn.Parameter(torch.Tensor(matrix_1_dim, matrix_2_dim))
+        else:
+            self._weight_matrix = torch.nn.Parameter(torch.Tensor(label_dim, matrix_1_dim, matrix_2_dim))
+
+        if use_input_biases:
+            self._weight_bias1 = torch.nn.Parameter(torch.Tensor(label_dim, matrix_1_dim))
+            self._weight_bias2 = torch.nn.Parameter(torch.Tensor(label_dim, matrix_2_dim))
+
+        self.use_input_biases = use_input_biases
+        self._bias = torch.nn.Parameter(torch.Tensor(1))
+        self._activation = activation or Activation.by_name('linear')()
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        torch.nn.init.xavier_uniform_(self._weight_matrix)
+        if self.use_input_biases:
+            torch.nn.init.xavier_uniform_(self._weight_bias1)
+            torch.nn.init.xavier_uniform_(self._weight_bias2)
+        self._bias.data.fill_(0.)
+
+    @overrides
+    def forward(self, matrix_1: torch.Tensor, matrix_2: torch.Tensor) -> torch.Tensor:
+        weight = self._weight_matrix
+        if weight.dim() == 2:
+            weight = weight.unsqueeze(0)
+        intermediate = torch.matmul(matrix_1.unsqueeze(1), weight)
+        final = torch.matmul(intermediate, matrix_2.unsqueeze(1).transpose(2, 3))
+        if self.use_input_biases:
+            final.add_(torch.matmul(self._weight_bias1, matrix_1.transpose(1, 2)).unsqueeze(3))
+            final.add_(torch.matmul(self._weight_bias2, matrix_2.transpose(1, 2)).unsqueeze(2))
+
+        return self._activation(final.squeeze(1) + self._bias)

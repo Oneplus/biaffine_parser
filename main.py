@@ -28,14 +28,15 @@ from biaffine_parser.elmo import ContextualizedWordEmbeddings
 from biaffine_parser.sum_input_encoder import AffineTransformInputEncoder, SummationInputEncoder
 from biaffine_parser.concat_input_encoder import ConcatenateInputEncoder
 from biaffine_parser.nadam import Nadam
-from biaffine_parser.partial_bilinear_matrix_attention import PartialBilinearMatrixAttention
+from biaffine_parser.partial_bilinear_matrix_attention import PartialBilinearMatrixAttention, BilinearMatrixAttentionV2
+from biaffine_parser.stacked_bidirectional_lstm import StackedBidirectionalLstmDozat
 from biaffine_parser.bilinear_with_bias import BilinearWithBias
 from allennlp.nn.activations import Activation
 from allennlp.modules.input_variational_dropout import InputVariationalDropout
 from allennlp.modules.matrix_attention.bilinear_matrix_attention import BilinearMatrixAttention
 from allennlp.modules.feedforward import FeedForward
-from allennlp.modules.seq2seq_encoders.seq2seq_encoder import Seq2SeqEncoder
-from allennlp.common.params import Params
+from allennlp.modules.seq2seq_encoders.pytorch_seq2seq_wrapper import PytorchSeq2SeqWrapper
+from allennlp.modules.stacked_bidirectional_lstm import StackedBidirectionalLstm
 from allennlp.nn.util import get_mask_from_sequence_lengths, get_range_vector
 from allennlp.nn.chu_liu_edmonds import decode_mst
 from allennlp.nn.util import get_device_of, masked_log_softmax, get_lengths_from_binary_sequence_mask
@@ -153,13 +154,20 @@ class BiaffineParser(torch.nn.Module):
         self.input_encoders = torch.nn.ModuleList(input_encoders)
 
         c = conf['context_encoder']
-        self.encoder = Seq2SeqEncoder.from_params(Params({
-            "type": "stacked_bidirectional_lstm",
-            "num_layers": c['num_layers'],
-            "input_size": input_dim,
-            "hidden_size": c['hidden_dim'],
-            "recurrent_dropout_probability": c['recurrent_dropout_probability'],
-            "use_highway": c['use_highway']}))
+        if c['type'] == 'stacked_bidirectional_lstm_dozat':
+            self.encoder = PytorchSeq2SeqWrapper(
+                StackedBidirectionalLstmDozat(num_layers=c['num_layers'],
+                                              input_size=input_dim,
+                                              hidden_size=c['hidden_dim'],
+                                              recurrent_dropout_probability=c['recurrent_dropout_probability']),
+                stateful=False)
+        else:
+            self.encoder = PytorchSeq2SeqWrapper(
+                StackedBidirectionalLstm(num_layers=c['num_layers'],
+                                         input_size=input_dim,
+                                         hidden_size=c['hidden_dim'],
+                                         recurrent_dropout_probability=c['recurrent_dropout_probability']),
+                stateful=False)
 
         encoder_dim = self.encoder.get_output_dim()
         c = conf['biaffine_parser']
@@ -174,8 +182,13 @@ class BiaffineParser(torch.nn.Module):
         self.head_tag_feedforward = FeedForward(encoder_dim, 1, tag_representation_dim, Activation.by_name("elu")())
         self.child_tag_feedforward = FeedForward(encoder_dim, 1, tag_representation_dim, Activation.by_name("elu")())
 
-        self.arc_attention = BilinearMatrixAttention(arc_representation_dim, arc_representation_dim,
-                                                     use_input_biases=True)
+        arc_attention_version = c.get('arc_attention_version', 'v1')
+        if arc_attention_version == 'v2':
+            self.arc_attention = BilinearMatrixAttentionV2(arc_representation_dim, arc_representation_dim,
+                                                           use_input_biases=True)
+        else:
+            self.arc_attention = BilinearMatrixAttention(arc_representation_dim, arc_representation_dim,
+                                                         use_input_biases=True)
 
         self.tag_bilinear = BilinearWithBias(tag_representation_dim, tag_representation_dim, n_relations)
 
@@ -186,7 +199,7 @@ class BiaffineParser(torch.nn.Module):
         self.context_encoding_timer = TimeRecoder()
         self.classification_timer = TimeRecoder()
 
-        self.reset_parameters()
+        #self.reset_parameters()
 
     def reset_parameters(self):
         for feedforward in [self.head_arc_feedforward, self.head_tag_feedforward,
@@ -413,8 +426,7 @@ class BiaffineParser(torch.nn.Module):
 
         # shape (batch_size, sequence_length, num_head_tags)
         head_tag_logits = self._get_head_tags(head_tag_representation, child_tag_representation, head_indices)
-        normalised_head_tag_logits = masked_log_softmax(head_tag_logits,
-                                                        mask.unsqueeze(-1)) * float_mask.unsqueeze(-1)
+        normalised_head_tag_logits = torch.nn.functional.log_softmax(head_tag_logits, dim=-1) * float_mask.unsqueeze(-1)
         # index matrix with shape (batch, sequence_length)
         timestep_index = get_range_vector(sequence_length, get_device_of(attended_arcs))
         child_index = timestep_index.view(1, sequence_length).expand(batch_size, sequence_length).long()
@@ -521,7 +533,6 @@ def train_model(epoch: int,
     start_time = time.time()
 
     witnessed_improved_valid_result = False
-    report_loss, report_arc_loss, report_tag_loss, report_n_tags = 0., 0., 0., 0.
     total_loss, total_arc_loss, total_tag_loss, total_n_tags = 0., 0., 0., 0.
     for inputs, head_indices, head_tags, _ in train_batch.get():
         cnt += 1
@@ -530,10 +541,6 @@ def train_model(epoch: int,
 
         n_tags = inputs['length'].sum().item()
         loss = forward_output_dict['loss']
-        report_loss += loss.item()
-        report_arc_loss += forward_output_dict['arc_loss'].item()
-        report_tag_loss += forward_output_dict['tag_loss'].item()
-        report_n_tags += n_tags
 
         total_loss += loss.item() * n_tags
         total_arc_loss += forward_output_dict['arc_loss'].item() * n_tags
@@ -549,19 +556,21 @@ def train_model(epoch: int,
         if cnt % opt.report_steps == 0:
             logger.info("Epoch={} iter={} lr={:.6f} loss={:.4f} (arc={:.4f}, rel={:.4f}) "
                         "time={:.2f}s".format(epoch, cnt, optimizer.param_groups[0]['lr'],
-                                              report_loss / report_n_tags,
-                                              report_arc_loss / report_n_tags,
-                                              report_tag_loss / report_n_tags,
+                                              total_loss / total_n_tags,
+                                              total_arc_loss / total_n_tags,
+                                              total_tag_loss / total_n_tags,
                                               time.time() - start_time))
             start_time = time.time()
-            report_loss, report_arc_loss, report_tag_loss, report_n_tags = 0., 0., 0., 0.
 
         if cnt % opt.eval_steps == 0:
             eval_time = time.time()
             valid_result = eval_model(model, valid_batch, ix2label, opt, opt.gold_valid_path)
             logger.info("Epoch={} iter={} lr={:.6f} loss={:.4f} (arc={:.4f}, rel={:.4f}) valid_acc={:.6f}".format(
                 epoch, cnt, optimizer.param_groups[0]['lr'],
-                total_loss, total_arc_loss, total_tag_loss, valid_result))
+                total_loss / total_n_tags,
+                total_arc_loss / total_n_tags,
+                total_tag_loss / total_n_tags,
+                valid_result))
 
             if valid_result > best_valid:
                 witnessed_improved_valid_result = True
@@ -607,6 +616,7 @@ def train():
 
     torch.manual_seed(opt.seed)
     random.seed(opt.seed)
+    numpy.random.seed(opt.seed)
     if opt.gpu >= 0:
         torch.cuda.set_device(opt.gpu)
         if opt.seed > 0:
