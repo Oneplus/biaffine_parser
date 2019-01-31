@@ -1,18 +1,12 @@
 from typing import Optional, Tuple
 import torch
-from torch.nn.utils.rnn import PackedSequence, pack_padded_sequence, pad_packed_sequence
+
+from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence, PackedSequence
+
 from allennlp.common.checks import ConfigurationError
+from allennlp.nn.util import get_dropout_mask
 from allennlp.nn.initializers import block_orthogonal
 from allennlp.nn.activations import Activation
-
-
-def get_dropout_mask(dropout_probability: float,
-                     tensor_for_masking: torch.Tensor,
-                     mask_size: torch.Size) -> torch.Tensor:
-    binary_mask = tensor_for_masking.new_tensor(torch.rand(mask_size) > dropout_probability)
-    # Scale mask by 1/keep_prob to preserve output statistics.
-    dropout_mask = binary_mask.float().div(1.0 - dropout_probability)
-    return dropout_mask
 
 
 class DozatLstmCell(torch.nn.Module):
@@ -20,7 +14,8 @@ class DozatLstmCell(torch.nn.Module):
                  input_size: int,
                  hidden_size: int,
                  activation: Activation,
-                 go_forward: bool = True) -> None:
+                 go_forward: bool = True,
+                 recurrent_dropout_probability: float = 0.0) -> None:
         super(DozatLstmCell, self).__init__()
         # Required to be wrapped with a :class:`PytorchSeq2SeqWrapper`.
         self.input_size = input_size
@@ -28,6 +23,7 @@ class DozatLstmCell(torch.nn.Module):
 
         self.go_forward = go_forward
         self.activation = activation
+        self.recurrent_dropout_probability = recurrent_dropout_probability
 
         # We do the projections for all the gates all at once, so if we are
         # using highway layers, we need some extra projections, which is
@@ -49,7 +45,6 @@ class DozatLstmCell(torch.nn.Module):
 
     def forward(self,  # pylint: disable=arguments-differ
                 inputs: PackedSequence,
-                recurrent_dropout_mask: torch.Tensor,
                 initial_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
         if not isinstance(inputs, PackedSequence):
             raise ConfigurationError('inputs must be PackedSequence but got %s' % (type(inputs)))
@@ -67,6 +62,14 @@ class DozatLstmCell(torch.nn.Module):
             full_batch_previous_memory = initial_state[1].squeeze(0)
 
         current_length_index = batch_size - 1 if self.go_forward else 0
+        if self.recurrent_dropout_probability > 0.0:
+            dropout_mask = get_dropout_mask(self.recurrent_dropout_probability, full_batch_previous_memory)
+            input_dropout_mask = get_dropout_mask(self.recurrent_dropout_probability, sequence_tensor)
+
+            if self.training:
+                sequence_tensor = sequence_tensor * input_dropout_mask
+        else:
+            dropout_mask = None
 
         for timestep in range(total_timesteps):
             # The index depends on which end we start.
@@ -108,8 +111,8 @@ class DozatLstmCell(torch.nn.Module):
             timestep_output = output_gate * self.activation(memory)
 
             # Only do dropout if the dropout prob is > 0.0 and we are in training mode.
-            if recurrent_dropout_mask is not None and self.training:
-                timestep_output = timestep_output * recurrent_dropout_mask[0: current_length_index + 1]
+            if dropout_mask is not None and self.training:
+                timestep_output = timestep_output * dropout_mask[0: current_length_index + 1]
 
             full_batch_previous_memory = full_batch_previous_memory.data.clone()
             full_batch_previous_state = full_batch_previous_state.data.clone()
@@ -143,14 +146,17 @@ class StackedBidirectionalLstmDozat(torch.nn.Module):
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.bidirectional = True
-        self.recurrent_dropout_probability = recurrent_dropout_probability
 
         layers = []
         lstm_input_size = input_size
         for layer_index in range(num_layers):
 
-            forward_layer = DozatLstmCell(lstm_input_size, hidden_size, activation=activation, go_forward=True)
-            backward_layer = DozatLstmCell(lstm_input_size, hidden_size, activation=activation, go_forward=False)
+            forward_layer = DozatLstmCell(lstm_input_size, hidden_size,
+                                          activation=activation, go_forward=True,
+                                          recurrent_dropout_probability=recurrent_dropout_probability)
+            backward_layer = DozatLstmCell(lstm_input_size, hidden_size,
+                                           activation=activation, go_forward=False,
+                                           recurrent_dropout_probability=recurrent_dropout_probability)
 
             lstm_input_size = hidden_size * 2
             self.add_module('forward_layer_{}'.format(layer_index), forward_layer)
@@ -170,18 +176,6 @@ class StackedBidirectionalLstmDozat(torch.nn.Module):
             hidden_states = list(zip(initial_state[0].split(1, 0),
                                      initial_state[1].split(1, 0)))
 
-        if self.recurrent_dropout_probability > 0:
-            sequence_tensor, batch_lengths = pad_packed_sequence(inputs, batch_first=True)
-            input_dropout_mask = get_dropout_mask(self.recurrent_dropout_probability, sequence_tensor,
-                                                  sequence_tensor.size())
-            recurrent_dropout_mask = get_dropout_mask(self.recurrent_dropout_probability, sequence_tensor,
-                                                      sequence_tensor.size()[:-2] + (self.hidden_size,))
-
-            sequence_tensor = sequence_tensor * input_dropout_mask
-            inputs = pack_padded_sequence(sequence_tensor, batch_lengths, batch_first=True)
-        else:
-            recurrent_dropout_mask = None
-
         output_sequence = inputs
         final_states = []
         for i, state in enumerate(hidden_states):
@@ -189,8 +183,8 @@ class StackedBidirectionalLstmDozat(torch.nn.Module):
             backward_layer = getattr(self, 'backward_layer_{}'.format(i))
 
             # The state is duplicated to mirror the Pytorch API for LSTMs.
-            forward_output, final_forward_state = forward_layer(output_sequence, recurrent_dropout_mask, state)
-            backward_output, final_backward_state = backward_layer(output_sequence, recurrent_dropout_mask, state)
+            forward_output, final_forward_state = forward_layer(output_sequence, state)
+            backward_output, final_backward_state = backward_layer(output_sequence, state)
 
             forward_output, lengths = pad_packed_sequence(forward_output, batch_first=True)
             backward_output, _ = pad_packed_sequence(backward_output, batch_first=True)

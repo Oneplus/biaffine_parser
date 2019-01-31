@@ -33,9 +33,7 @@ class AffineTransformInputEncoder(InputEncoderBase):
     def forward(self, inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
         arbitrary_input_ = next(iter(inputs.values()))
         batch_size, seq_len, _ = arbitrary_input_.size()
-        output = torch.zeros([batch_size, seq_len, self.output_dim_])
-        if self.use_cuda:
-            output = output.cuda()
+        output = arbitrary_input_.new_zeros([batch_size, seq_len, self.output_dim_])
 
         for name, projection in self.projections.items():
             output.add_(projection(inputs[name]))
@@ -65,9 +63,7 @@ class SummationInputEncoder(InputEncoderBase):
     def forward(self, inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
         arbitrary_input_ = next(iter(inputs.values()))
         batch_size, seq_len, _ = arbitrary_input_.size()
-        output = torch.zeros([batch_size, seq_len, self.output_dim_])
-        if self.use_cuda:
-            output = output.cuda()
+        output = arbitrary_input_.new_zeros([batch_size, seq_len, self.output_dim_])
 
         for name in self.ordered_names:
             output.add_(inputs[name])
