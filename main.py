@@ -30,7 +30,8 @@ from biaffine_parser.concat_input_encoder import ConcatenateInputEncoder
 from biaffine_parser.dummy_ctx_encoder import DummyContextEncoder
 from biaffine_parser.nadam import Nadam
 from biaffine_parser.partial_bilinear_matrix_attention import PartialBilinearMatrixAttention, BilinearMatrixAttentionV2
-from biaffine_parser.stacked_bidirectional_lstm import StackedBidirectionalLstmDozat
+from biaffine_parser.stacked_bidirectional_lstm import InputDropoutedStackedBidirectionalLstm
+from biaffine_parser.stacked_bidirectional_lstm import DozatLstmCell, MaLstmCell
 from biaffine_parser.bilinear_with_bias import BilinearWithBias
 from allennlp.nn.activations import Activation
 from allennlp.modules.input_variational_dropout import InputVariationalDropout
@@ -157,19 +158,19 @@ class BiaffineParser(torch.nn.Module):
         c = conf['context_encoder']
         if c['type'] == 'stacked_bidirectional_lstm_dozat':
             self.encoder = PytorchSeq2SeqWrapper(
-                StackedBidirectionalLstmDozat(num_layers=c['num_layers'],
-                                              input_size=input_dim,
-                                              hidden_size=c['hidden_dim'],
-                                              recurrent_dropout_probability=c['recurrent_dropout_probability'],
-                                              activation=Activation.by_name("leaky_relu")()),
+                InputDropoutedStackedBidirectionalLstm(DozatLstmCell, num_layers=c['num_layers'],
+                                                       input_size=input_dim,
+                                                       hidden_size=c['hidden_dim'],
+                                                       recurrent_dropout_probability=c['recurrent_dropout_probability'],
+                                                       activation=Activation.by_name("leaky_relu")()),
                 stateful=False)
         elif c['type'] == 'stacked_bidirectional_lstm_ma':
             self.encoder = PytorchSeq2SeqWrapper(
-                StackedBidirectionalLstmDozat(num_layers=c['num_layers'],
-                                              input_size=input_dim,
-                                              hidden_size=c['hidden_dim'],
-                                              recurrent_dropout_probability=c['recurrent_dropout_probability'],
-                                              activation=Activation.by_name("tanh")()),
+                InputDropoutedStackedBidirectionalLstm(MaLstmCell, num_layers=c['num_layers'],
+                                                       input_size=input_dim,
+                                                       hidden_size=c['hidden_dim'],
+                                                       recurrent_dropout_probability=c['recurrent_dropout_probability'],
+                                                       activation=Activation.by_name("tanh")()),
                 stateful=False)
         elif c['type'] == 'stacked_bidirectional_lstm':
             self.encoder = PytorchSeq2SeqWrapper(
@@ -246,7 +247,6 @@ class BiaffineParser(torch.nn.Module):
 
             context_encoded_input = self.encoder(encoded_input, mask)
             # context_encoded_input: (batch_size, seq_len, encoded_dim)
-            context_encoded_input = self.dropout_(context_encoded_input)
 
             # handle the sentinel/dummy root.
             batch_size, _, encoding_dim = context_encoded_input.size()
@@ -262,6 +262,8 @@ class BiaffineParser(torch.nn.Module):
                 head_indices = torch.cat([head_indices.new_zeros(batch_size, 1), head_indices], 1)
             if head_tags is not None:
                 head_tags = torch.cat([head_tags.new_zeros(batch_size, 1), head_tags], 1)
+
+            context_encoded_input = self.dropout_(context_encoded_input)
 
             head_arc_representation = self.head_arc_feedforward(context_encoded_input)
             child_arc_representation = self.child_arc_feedforward(context_encoded_input)
@@ -324,6 +326,48 @@ class BiaffineParser(torch.nn.Module):
                 }
 
         return output_dict
+
+    def _construct_loss(self,
+                        head_tag_representation: torch.Tensor,
+                        child_tag_representation: torch.Tensor,
+                        attended_arcs: torch.Tensor,
+                        head_indices: torch.Tensor,
+                        head_tags: torch.Tensor,
+                        mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        float_mask = mask.float()
+
+        minus_inf = -1e8
+        minus_mask = (1 - float_mask) * minus_inf
+        attended_arcs = attended_arcs + minus_mask.unsqueeze(2) + minus_mask.unsqueeze(1)
+
+        batch_size, sequence_length, _ = attended_arcs.size()
+        # shape (batch_size, 1)
+        range_vector = get_range_vector(batch_size, get_device_of(attended_arcs)).unsqueeze(1)
+        # shape (batch_size, sequence_length, sequence_length)
+        normalised_arc_logits = masked_log_softmax(attended_arcs,
+                                                   mask) * float_mask.unsqueeze(2) * float_mask.unsqueeze(1)
+
+        # shape (batch_size, sequence_length, num_head_tags)
+        head_tag_logits = self._get_head_tags(head_tag_representation, child_tag_representation, head_indices)
+        normalised_head_tag_logits = torch.nn.functional.log_softmax(head_tag_logits, dim=-1) * float_mask.unsqueeze(-1)
+        # index matrix with shape (batch, sequence_length)
+        timestep_index = get_range_vector(sequence_length, get_device_of(attended_arcs))
+        child_index = timestep_index.view(1, sequence_length).expand(batch_size, sequence_length).long()
+        # shape (batch_size, sequence_length)
+        arc_loss = normalised_arc_logits[range_vector, child_index, head_indices]
+        tag_loss = normalised_head_tag_logits[range_vector, child_index, head_tags]
+        # We don't care about predictions for the symbolic ROOT token's head,
+        # so we remove it from the loss.
+        arc_loss = arc_loss[:, 1:]
+        tag_loss = tag_loss[:, 1:]
+
+        # The number of valid positions is equal to the number of unmasked elements minus
+        # 1 per sequence in the batch, to account for the symbolic HEAD token.
+        valid_positions = mask.sum() - batch_size
+
+        arc_nll = -arc_loss.sum() / valid_positions.float()
+        tag_nll = -tag_loss.sum() / valid_positions.float()
+        return arc_nll, tag_nll
 
     def _greedy_decode(self,
                        head_tag_representation: torch.Tensor,
@@ -415,48 +459,6 @@ class BiaffineParser(torch.nn.Module):
             head_tags.append(instance_head_tags)
         return torch.from_numpy(numpy.stack(heads)), torch.from_numpy(numpy.stack(head_tags))
 
-    def _construct_loss(self,
-                        head_tag_representation: torch.Tensor,
-                        child_tag_representation: torch.Tensor,
-                        attended_arcs: torch.Tensor,
-                        head_indices: torch.Tensor,
-                        head_tags: torch.Tensor,
-                        mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        float_mask = mask.float()
-
-        minus_inf = -1e8
-        minus_mask = (1 - float_mask) * minus_inf
-        attended_arcs = attended_arcs + minus_mask.unsqueeze(2) + minus_mask.unsqueeze(1)
-
-        batch_size, sequence_length, _ = attended_arcs.size()
-        # shape (batch_size, 1)
-        range_vector = get_range_vector(batch_size, get_device_of(attended_arcs)).unsqueeze(1)
-        # shape (batch_size, sequence_length, sequence_length)
-        normalised_arc_logits = masked_log_softmax(attended_arcs,
-                                                   mask) * float_mask.unsqueeze(2) * float_mask.unsqueeze(1)
-
-        # shape (batch_size, sequence_length, num_head_tags)
-        head_tag_logits = self._get_head_tags(head_tag_representation, child_tag_representation, head_indices)
-        normalised_head_tag_logits = torch.nn.functional.log_softmax(head_tag_logits, dim=-1) * float_mask.unsqueeze(-1)
-        # index matrix with shape (batch, sequence_length)
-        timestep_index = get_range_vector(sequence_length, get_device_of(attended_arcs))
-        child_index = timestep_index.view(1, sequence_length).expand(batch_size, sequence_length).long()
-        # shape (batch_size, sequence_length)
-        arc_loss = normalised_arc_logits[range_vector, child_index, head_indices]
-        tag_loss = normalised_head_tag_logits[range_vector, child_index, head_tags]
-        # We don't care about predictions for the symbolic ROOT token's head,
-        # so we remove it from the loss.
-        arc_loss = arc_loss[:, 1:]
-        tag_loss = tag_loss[:, 1:]
-
-        # The number of valid positions is equal to the number of unmasked elements minus
-        # 1 per sequence in the batch, to account for the symbolic HEAD token.
-        valid_positions = mask.sum() - batch_size
-
-        arc_nll = -arc_loss.sum() / valid_positions.float()
-        tag_nll = -tag_loss.sum() / valid_positions.float()
-        return arc_nll, tag_nll
-
     def _get_head_tags(self,
                        head_tag_representation: torch.Tensor,
                        child_tag_representation: torch.Tensor,
@@ -487,7 +489,7 @@ class BiaffineParser(torch.nn.Module):
 
 def eval_model(model: BiaffineParser,
                batcher: Batcher,
-               ix2label: Dict[int, str],
+               id2label: Dict[int, str],
                args,
                gold_path: str):
     if args.output is not None:
@@ -498,21 +500,27 @@ def eval_model(model: BiaffineParser,
         fpo = codecs.getwriter('utf-8')(os.fdopen(descriptor, 'w'))
 
     model.eval()
-    orders = []
-    results = []
+    orders, results, sentences = [], [], []
+    cnt = 0
     for inputs, head_indices, head_tags, order in batcher.get():
+        cnt += 1
         forward_output_dict = model.forward(inputs, head_tags, head_indices)
         for bid in range(len(inputs['text'])):
             heads = forward_output_dict["heads"][bid][1:]
             tags = forward_output_dict["head_tags"][bid][1:]
             length = inputs['length'][bid].item()
+            words = [word for i, word in enumerate(inputs['text'][bid]) if i < length]
             result = [(head.item(), tag.item()) for i, (head, tag) in enumerate(zip(heads, tags)) if i < length]
             results.append(result)
+            sentences.append(words)
+        if cnt % model_cmd_opt.report_steps == 0:
+            logger.info('finished {0} x {1} batches'.format(cnt, model_cmd_opt.batch_size))
         orders.extend(order)
 
-    for _, result in sorted(list(enumerate(results)), key=lambda p: orders[p[0]]):
+    for o in sorted(range(len(results)), key=lambda p: orders[p]):
+        words, result = sentences[o], results[o]
         for i, (head, tag) in enumerate(result):
-            print('{0}\t_\t_\t_\t_\t_\t{1}\t{2}\t_\t_'.format(i + 1, head, ix2label[tag]), file=fpo)
+            print('{0}\t{1}\t_\t_\t_\t_\t{2}\t{3}\t_\t_'.format(i + 1, words[i], head, id2label[tag]), file=fpo)
         print(file=fpo)
     fpo.close()
 
@@ -877,8 +885,7 @@ def test():
         fpo = codecs.getwriter('utf-8')(sys.stdout)
 
     model.eval()
-    orders = []
-    results = []
+    orders, results, sentences = [], [], []
     cnt = 0
     for inputs, head_indices, head_tags, order in batcher.get():
         cnt += 1
@@ -887,15 +894,18 @@ def test():
             heads = forward_output_dict["heads"][bid][1:]
             tags = forward_output_dict["head_tags"][bid][1:]
             length = inputs['length'][bid].item()
+            words = [word for i, word in enumerate(inputs['text'][bid]) if i < length]
             result = [(head.item(), tag.item()) for i, (head, tag) in enumerate(zip(heads, tags)) if i < length]
             results.append(result)
+            sentences.append(words)
         if cnt % model_cmd_opt.report_steps == 0:
             logger.info('finished {0} x {1} batches'.format(cnt, model_cmd_opt.batch_size))
         orders.extend(order)
 
-    for _, result in sorted(list(enumerate(results)), key=lambda p: orders[p[0]]):
+    for o in sorted(range(len(results)), key=lambda p: orders[p]):
+        words, result = sentences[o], results[o]
         for i, (head, tag) in enumerate(result):
-            print('{0}\t_\t_\t_\t_\t_\t{1}\t{2}\t_\t_'.format(i + 1, head, id2label[tag]), file=fpo)
+            print('{0}\t{1}\t_\t_\t_\t_\t{2}\t{3}\t_\t_'.format(i + 1, words[i], head, id2label[tag]), file=fpo)
         print(file=fpo)
     fpo.close()
 

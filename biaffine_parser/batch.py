@@ -6,6 +6,8 @@ import torch
 import logging
 import collections
 import gzip
+import numpy as np
+from sklearn.cluster import KMeans
 logger = logging.getLogger(__name__)
 
 
@@ -319,17 +321,24 @@ class Batcher(BatcherBase):
 
 
 class BucketBatcher(BatcherBase):
-    # TODO: use kmeans to get _buckets
-    _buckets = [10, 15, 20, 25, 30, 35, 40, 50, 60, 70, 80, 90, 100, 140]
-
     def __init__(self, raw_dataset_: List[List[List[str]]],
                  input_batchers_: Dict[str, InputBatchBase],
                  head_batcher_: HeadBatch,
                  relation_batcher_: RelationBatch,
                  batch_size: int,
+                 n_buckets: int = 10,
                  use_cuda: bool = False):
         super(BucketBatcher, self).__init__(raw_dataset_, input_batchers_, head_batcher_, relation_batcher_,
                                             batch_size, use_cuda)
+        lengths = [[len(data)] for data in raw_dataset_]
+        kmeans = KMeans(n_buckets, random_state=0).fit(np.array(lengths, dtype=np.int))
+        self.n_buckets = n_buckets
+        self._buckets = []
+        for target_label in range(n_buckets):
+            self._buckets.append(
+                max([lengths[i][0] + 1 for i, label in enumerate(kmeans.labels_) if label == target_label]))
+        self._buckets.sort()
+        logger.info(self._buckets)
 
     def reset_batch_indices(self):
         buckets = [[] for _ in self._buckets]
