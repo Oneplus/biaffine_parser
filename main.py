@@ -235,10 +235,9 @@ class BiaffineParser(torch.nn.Module):
             for encoder_ in self.input_encoders:
                 ordered_names = encoder_.get_ordered_names()
                 args_ = {name: embeded_input[name] for name in ordered_names}
-                encoded_input.append(encoder_(args_))
+                encoded_input.append(self.input_dropout_(encoder_(args_)))
 
             encoded_input = torch.cat(encoded_input, dim=-1)
-            encoded_input = self.input_dropout_(encoded_input)
             # encoded_input: (batch_size, seq_len, input_dim)
 
         with self.context_encoding_timer as _:

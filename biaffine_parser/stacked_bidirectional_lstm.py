@@ -7,6 +7,7 @@ from allennlp.common.checks import ConfigurationError
 from allennlp.nn.util import get_dropout_mask
 from allennlp.nn.initializers import block_orthogonal
 from allennlp.nn.activations import Activation
+from allennlp.modules.input_variational_dropout import InputVariationalDropout
 
 
 class DozatLstmCell(torch.nn.Module):
@@ -62,12 +63,10 @@ class DozatLstmCell(torch.nn.Module):
             full_batch_previous_memory = initial_state[1].squeeze(0)
 
         current_length_index = batch_size - 1 if self.go_forward else 0
-        if self.recurrent_dropout_probability > 0.0:
+        if self.recurrent_dropout_probability > 0.0 and self.training:
             dropout_mask = get_dropout_mask(self.recurrent_dropout_probability, full_batch_previous_memory)
-            input_dropout_mask = get_dropout_mask(self.recurrent_dropout_probability, sequence_tensor)
-
-            if self.training:
-                sequence_tensor = sequence_tensor * input_dropout_mask
+            input_dropout_ = InputVariationalDropout(p=self.recurrent_dropout_probability)
+            sequence_tensor = input_dropout_(sequence_tensor)
         else:
             dropout_mask = None
 
@@ -107,7 +106,6 @@ class DozatLstmCell(torch.nn.Module):
             output_gate = torch.sigmoid(projected_input[:, 3 * self.hidden_size:4 * self.hidden_size] +
                                         projected_state[:, 3 * self.hidden_size:4 * self.hidden_size])
             memory = input_gate * memory_init + forget_gate * previous_memory
-            #
             timestep_output = output_gate * self.activation(memory)
 
             # Only do dropout if the dropout prob is > 0.0 and we are in training mode.
