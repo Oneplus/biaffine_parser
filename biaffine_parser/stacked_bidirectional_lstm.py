@@ -149,8 +149,7 @@ class MaLstmCell(LstmCellBase):
         # We do the projections for all the gates all at once, so if we are
         # using highway layers, we need some extra projections, which is
         # why the sizes of the Linear layers change here depending on this flag.
-        self.input_linearities = torch.nn.ModuleList(
-            [torch.nn.Linear(input_size, hidden_size, bias=False) for _ in range(4)])
+        self.input_linearity = torch.nn.Linear(input_size, 4 * hidden_size, bias=False)
         self.state_linearities = torch.nn.ModuleList(
             [torch.nn.Linear(hidden_size, hidden_size, bias=True) for _ in range(4)])
         self.reset_parameters()
@@ -158,8 +157,8 @@ class MaLstmCell(LstmCellBase):
     def reset_parameters(self):
         # Use sensible default initializations for parameters.
         stdv = 1.0 / np.sqrt(self.hidden_size)
+        torch.nn.init.uniform_(self.input_linearity.weight, -stdv, stdv)
         for i in range(4):
-            torch.nn.init.uniform_(self.input_linearities[i].weight, -stdv, stdv)
             torch.nn.init.uniform_(self.state_linearities[i].weight, -stdv, stdv)
             self.state_linearities[i].bias.data.fill_(0.0 if i != 1 else 1.0)
 
@@ -210,25 +209,31 @@ class MaLstmCell(LstmCellBase):
             previous_state = full_batch_previous_state[0: current_length_index + 1].clone()
             timestep_input = sequence_tensor[0: current_length_index + 1, index]
 
+            projected_input = self.input_linearity(timestep_input)
+
             # Main LSTM equations using relevant chunks of the big linear
             # projections of the hidden state and inputs.
             if self.recurrent_dropout_probability > 0.0 and self.training:
-                input_gate = torch.sigmoid(self.input_linearities[0](timestep_input) +
-                                           self.state_linearities[0](previous_state * dropout_masks[0][0: current_length_index + 1]))
-                forget_gate = torch.sigmoid(self.input_linearities[1](timestep_input) +
-                                            self.state_linearities[1](previous_state * dropout_masks[1][0: current_length_index + 1]))
-                memory_init = torch.tanh(self.input_linearities[2](timestep_input) +
-                                         self.state_linearities[2](previous_state * dropout_masks[2][0: current_length_index + 1]))
-                output_gate = torch.sigmoid(self.input_linearities[3](timestep_input) +
-                                            self.state_linearities[3](previous_state * dropout_masks[3][0: current_length_index + 1]))
+                input_gate = torch.sigmoid(
+                    projected_input[:, 0 * self.hidden_size:1 * self.hidden_size] +
+                    self.state_linearities[0](previous_state * dropout_masks[0][0: current_length_index + 1]))
+                forget_gate = torch.sigmoid(
+                    projected_input[:, 1 * self.hidden_size:2 * self.hidden_size] +
+                    self.state_linearities[1](previous_state * dropout_masks[1][0: current_length_index + 1]))
+                memory_init = torch.tanh(
+                    projected_input[:, 2 * self.hidden_size:3 * self.hidden_size] +
+                    self.state_linearities[2](previous_state * dropout_masks[2][0: current_length_index + 1]))
+                output_gate = torch.sigmoid(
+                    projected_input[:, 3 * self.hidden_size:4 * self.hidden_size] +
+                    self.state_linearities[3](previous_state * dropout_masks[3][0: current_length_index + 1]))
             else:
-                input_gate = torch.sigmoid(self.input_linearities[0](timestep_input) +
+                input_gate = torch.sigmoid(projected_input[:, 0 * self.hidden_size:1 * self.hidden_size] +
                                            self.state_linearities[0](previous_state))
-                forget_gate = torch.sigmoid(self.input_linearities[1](timestep_input) +
+                forget_gate = torch.sigmoid(projected_input[:, 1 * self.hidden_size:2 * self.hidden_size] +
                                             self.state_linearities[1](previous_state))
-                memory_init = torch.tanh(self.input_linearities[2](timestep_input) +
+                memory_init = torch.tanh(projected_input[:, 2 * self.hidden_size:3 * self.hidden_size] +
                                          self.state_linearities[2](previous_state))
-                output_gate = torch.sigmoid(self.input_linearities[3](timestep_input) +
+                output_gate = torch.sigmoid(projected_input[:, 3 * self.hidden_size:4 * self.hidden_size] +
                                             self.state_linearities[3](previous_state))
 
             memory = input_gate * memory_init + forget_gate * previous_memory

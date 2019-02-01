@@ -501,9 +501,7 @@ def eval_model(model: BiaffineParser,
 
     model.eval()
     orders, results, sentences = [], [], []
-    cnt = 0
     for inputs, head_indices, head_tags, order in batcher.get():
-        cnt += 1
         forward_output_dict = model.forward(inputs, head_tags, head_indices)
         for bid in range(len(inputs['text'])):
             heads = forward_output_dict["heads"][bid][1:]
@@ -513,8 +511,6 @@ def eval_model(model: BiaffineParser,
             result = [(head.item(), tag.item()) for i, (head, tag) in enumerate(zip(heads, tags)) if i < length]
             results.append(result)
             sentences.append(words)
-        if cnt % model_cmd_opt.report_steps == 0:
-            logger.info('finished {0} x {1} batches'.format(cnt, model_cmd_opt.batch_size))
         orders.extend(order)
 
     for o in sorted(range(len(results)), key=lambda p: orders[p]):
