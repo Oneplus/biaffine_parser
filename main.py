@@ -53,15 +53,20 @@ def dict2namedtuple(dic: Dict):
 
 
 def read_corpus(path: str):
-    ret = []
-    for block in open(path, 'r').read().strip().split('\n\n'):
-        items = []
-        for line in block.splitlines():
-            fields = line.strip().split()
-            assert len(fields) == 10
-            items.append(fields)
-        ret.append(items)
-    return ret
+    dataset = []
+    with codecs.open(path, 'r', encoding='utf-8') as fin:
+        for data in fin.read().strip().split('\n\n'):
+            lines = data.splitlines()
+            items = []
+            for line in lines:
+                if line.startswith('#'):
+                    continue
+                fields = tuple(line.strip().split())
+                if '.' in fields[0] or '-' in fields[0]:
+                    continue
+                items.append(fields)
+            dataset.append(items)
+    return dataset
 
 
 class TimeRecoder(object):
@@ -226,10 +231,8 @@ class BiaffineParser(torch.nn.Module):
                 head_indices: torch.LongTensor = None):
         with self.input_encoding_timer as _:
             embeded_input = {}
-            for name, input_ in inputs.items():
-                if name == 'text' or name == 'length':
-                    continue
-                fn = self.input_layers[name]
+            for name, fn in self.input_layers.items():
+                input_ = inputs[name]
                 embeded_input[name] = fn(input_)
 
             encoded_input = []
@@ -592,7 +595,7 @@ def train_model(epoch: int,
                 torch.save(model.state_dict(), os.path.join(opt.model, 'model.pkl'))
                 logger.info("New record achieved!")
                 best_valid = valid_result
-                if test is not None:
+                if test_batch is not None:
                     test_result = eval_model(model, test_batch, ix2label, opt, opt.gold_test_path)
                     logger.info("Epoch={} iter={} lr={:.6f} test_acc={:.6f}".format(
                         epoch, cnt, optimizer.param_groups[0]['lr'], test_result))
@@ -621,6 +624,7 @@ def train():
     cmd.add_argument('--gold_test_path', type=str, help='the path to the testing file.')
     cmd.add_argument("--model", required=True, help="path to save model")
     cmd.add_argument("--batch_size", "--batch", type=int, default=32, help='the batch size.')
+    cmd.add_argument('--override', help='override embeddings')
     cmd.add_argument("--max_epoch", type=int, default=100, help='the maximum number of iteration.')
     cmd.add_argument("--report_steps", type=int, default=1024, help='eval every x batches')
     cmd.add_argument("--eval_steps", type=int, help='eval every x batches')
@@ -639,6 +643,13 @@ def train():
             torch.cuda.manual_seed(opt.seed)
 
     conf = json.load(open(opt.config, 'r'))
+    if opt.override:
+        name, key, value = opt.override.split(':', 2)
+        c = conf['input']
+        for data in c:
+            if data['name'] == name:
+                data[key] = value
+
     if opt.gold_valid_path is None:
         opt.gold_valid_path = opt.valid_path
 
