@@ -58,10 +58,19 @@ def load_embedding_txt(path, has_header=False):
     if has_header:
         fin.readline()
 
+    dim = None
+    cnt = 0
     for line in fin:
         line = line.strip()
+        cnt += 1
         if line:
             parts = line.split()
+
+            if dim is None:
+                dim = len(parts[1:])
+            elif dim != len(parts[1:]):
+                logger.info('unequal number of fields in line {}: {}, expected {}'.format(cnt, len(parts[1:]), dim))
+                continue
             words.append(parts[0])
             vals += [float(x) for x in parts[1:]]  # equal to append
     return words, np.asarray(vals).reshape(len(words), -1)  # reshape

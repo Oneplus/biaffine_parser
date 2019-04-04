@@ -61,7 +61,7 @@ def read_corpus(path: str):
             for line in lines:
                 if line.startswith('#'):
                     continue
-                fields = tuple(line.strip().split())
+                fields = tuple(line.strip().split('\t'))
                 if '.' in fields[0] or '-' in fields[0]:
                     continue
                 items.append(fields)
@@ -167,6 +167,7 @@ class BiaffineParser(torch.nn.Module):
                                                        input_size=input_dim,
                                                        hidden_size=c['hidden_dim'],
                                                        recurrent_dropout_probability=c['recurrent_dropout_probability'],
+                                                       layer_dropout_probability=c['layer_dropout_probability'],
                                                        activation=Activation.by_name("leaky_relu")()),
                 stateful=False)
         elif c['type'] == 'stacked_bidirectional_lstm_ma':
@@ -175,6 +176,7 @@ class BiaffineParser(torch.nn.Module):
                                                        input_size=input_dim,
                                                        hidden_size=c['hidden_dim'],
                                                        recurrent_dropout_probability=c['recurrent_dropout_probability'],
+                                                       layer_dropout_probability=c['layer_dropout_probability'],
                                                        activation=Activation.by_name("tanh")()),
                 stateful=False)
         elif c['type'] == 'stacked_bidirectional_lstm':
@@ -182,7 +184,8 @@ class BiaffineParser(torch.nn.Module):
                 StackedBidirectionalLstm(num_layers=c['num_layers'],
                                          input_size=input_dim,
                                          hidden_size=c['hidden_dim'],
-                                         recurrent_dropout_probability=c['recurrent_dropout_probability']),
+                                         recurrent_dropout_probability=c['recurrent_dropout_probability'],
+                                         layer_dropout_probability=c['layer_dropout_probability']),
                 stateful=False)
         else:
             self.encoder = DummyContextEncoder()
@@ -572,40 +575,48 @@ def train_model(epoch: int,
         optimizer.step()
 
         if cnt % opt.report_steps == 0:
-            logger.info("Epoch={} iter={} lr={:.6f} loss={:.4f} (arc={:.4f}, rel={:.4f}) "
-                        "time={:.2f}s".format(epoch, cnt, optimizer.param_groups[0]['lr'],
-                                              total_loss / total_n_tags,
-                                              total_arc_loss / total_n_tags,
-                                              total_tag_loss / total_n_tags,
-                                              time.time() - start_time))
+            logger.info("| epoch {:3d} | step {:>6d} | lr {:.3g} | ms/batch {:5.2f} | loss {:.4f} "
+                        "(arc {:.4f} rel {:.4f}) |".format(epoch, cnt, optimizer.param_groups[0]['lr'],
+                                                           1000 * (time.time() - start_time) / opt.report_steps,
+                                                           total_loss / total_n_tags,
+                                                           total_arc_loss / total_n_tags,
+                                                           total_tag_loss / total_n_tags))
             start_time = time.time()
 
         if cnt % opt.eval_steps == 0:
             eval_time = time.time()
             valid_result = eval_model(model, valid_batch, ix2label, opt, opt.gold_valid_path)
-            logger.info("Epoch={} iter={} lr={:.6f} loss={:.4f} (arc={:.4f}, rel={:.4f}) valid_acc={:.6f}".format(
-                epoch, cnt, optimizer.param_groups[0]['lr'],
-                total_loss / total_n_tags,
-                total_arc_loss / total_n_tags,
-                total_tag_loss / total_n_tags,
-                valid_result))
+            logging_str = "| epoch {:3d} | step {:>6d} | lr {:.3g} | loss {:.4f} (arc {:.4f} rel {:.4f}) " \
+                          "| dev {:.4f} |".format(epoch, cnt, optimizer.param_groups[0]['lr'],
+                                                  total_loss / total_n_tags,
+                                                  total_arc_loss / total_n_tags,
+                                                  total_tag_loss / total_n_tags,
+                                                  valid_result)
+            if valid_result > best_valid:
+                logging_str = logging_str + ' NEW |'
+
+            logger.info(logging_str)
 
             if valid_result > best_valid:
                 witnessed_improved_valid_result = True
                 torch.save(model.state_dict(), os.path.join(opt.model, 'model.pkl'))
-                logger.info("New record achieved!")
                 best_valid = valid_result
                 if test_batch is not None:
                     test_result = eval_model(model, test_batch, ix2label, opt, opt.gold_test_path)
-                    logger.info("Epoch={} iter={} lr={:.6f} test_acc={:.6f}".format(
-                        epoch, cnt, optimizer.param_groups[0]['lr'], test_result))
+                    logging_str = "| epoch {:3d} | step {:>6d} | lr {:.3g} | " \
+                                  "| test {:.4f} |".format(epoch, cnt, optimizer.param_groups[0]['lr'],
+                                                           test_result)
+                    logger.info(logging_str)
             eval_time = time.time() - eval_time
             start_time += eval_time
 
-    logger.info("EndOfEpoch={} iter={} lr={:.6f} loss={:.4f} (arc={:.4f}, rel={:.4f}) ".format(
-        epoch, cnt, optimizer.param_groups[0]['lr'],
-        total_loss / total_n_tags, total_arc_loss / total_n_tags, total_tag_loss / total_n_tags))
-    logger.info("Time Tracker: input={:.2f}s | context={:.2f}s | classification={:.2f}s".format(
+    logging_str = "| epoch {:3d} | step {:>6d} | lr {:.3g} | loss {:.4f} " \
+                  "(arc {:.4f} rel {:.4f}) |".format(epoch, cnt, optimizer.param_groups[0]['lr'],
+                                                     total_loss / total_n_tags,
+                                                     total_arc_loss / total_n_tags,
+                                                     total_tag_loss / total_n_tags)
+    logger.info(logging_str)
+    logger.info("| time tracking | input {:.2f}s | context {:.2f}s | classification {:.2f}s".format(
         model.input_encoding_timer.total_eclipsed_time(),
         model.context_encoding_timer.total_eclipsed_time(),
         model.classification_timer.total_eclipsed_time()))
@@ -683,7 +694,7 @@ def train():
             if 'pretrained' in c:
                 batcher.create_dict_from_file(c['pretrained'])
             if c['fixed']:
-                if not 'pretrained' in c:
+                if 'pretrained' not in c:
                     logger.warning('it is un-reasonable to use fix embedding without pretraining.')
             else:
                 batcher.create_dict_from_dataset(raw_training_data_)
@@ -801,8 +812,8 @@ def train():
         else:
             patience = 0
 
-    logger.info("best_valid_acc: {:.6f}".format(best_valid))
-    logger.info("test_acc: {:.6f}".format(test_result))
+    logger.info("best dev {:.4f}".format(best_valid))
+    logger.info("test {:.4f}".format(test_result))
 
 
 def test():

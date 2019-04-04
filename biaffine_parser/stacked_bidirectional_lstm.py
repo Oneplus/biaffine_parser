@@ -26,7 +26,6 @@ class LstmCellBase(torch.nn.Module):
         self.go_forward = go_forward
         self.activation = activation
         self.recurrent_dropout_probability = recurrent_dropout_probability
-        self.input_dropout_ = InputVariationalDropout(p=recurrent_dropout_probability)
 
 
 class DozatLstmCell(LstmCellBase):
@@ -77,7 +76,6 @@ class DozatLstmCell(LstmCellBase):
         current_length_index = batch_size - 1 if self.go_forward else 0
         if self.recurrent_dropout_probability > 0.0 and self.training:
             dropout_mask = get_dropout_mask(self.recurrent_dropout_probability, full_batch_previous_state)
-            sequence_tensor = self.input_dropout_(sequence_tensor)
         else:
             dropout_mask = None
 
@@ -100,6 +98,10 @@ class DozatLstmCell(LstmCellBase):
             # Actually get the slices of the batch which we need for the computation at this timestep.
             previous_memory = full_batch_previous_memory[0: current_length_index + 1].clone()
             previous_state = full_batch_previous_state[0: current_length_index + 1].clone()
+            # Only do recurrent dropout if the dropout prob is > 0.0 and we are in training mode.
+            if dropout_mask is not None and self.training:
+                previous_state = previous_state * dropout_mask[0: current_length_index + 1]
+
             timestep_input = sequence_tensor[0: current_length_index + 1, index]
 
             # Do the projections for all the gates all at once.
@@ -118,10 +120,6 @@ class DozatLstmCell(LstmCellBase):
                                         projected_state[:, 3 * self.hidden_size:4 * self.hidden_size])
             memory = input_gate * memory_init + forget_gate * previous_memory
             timestep_output = output_gate * self.activation(memory)
-
-            # Only do dropout if the dropout prob is > 0.0 and we are in training mode.
-            if dropout_mask is not None and self.training:
-                timestep_output = timestep_output * dropout_mask[0: current_length_index + 1]
 
             full_batch_previous_memory = full_batch_previous_memory.data.clone()
             full_batch_previous_state = full_batch_previous_state.data.clone()
@@ -184,7 +182,6 @@ class MaLstmCell(LstmCellBase):
         if self.recurrent_dropout_probability > 0.0 and self.training:
             dropout_masks = [get_dropout_mask(self.recurrent_dropout_probability, full_batch_previous_state)
                              for _ in range(4)]
-            sequence_tensor = self.input_dropout_(sequence_tensor)
         else:
             dropout_masks = None
 
@@ -264,7 +261,8 @@ class InputDropoutedStackedBidirectionalLstm(torch.nn.Module):
                  hidden_size: int,
                  num_layers: int,
                  activation: Activation,
-                 recurrent_dropout_probability: float = 0.0) -> None:
+                 recurrent_dropout_probability: float = 0.0,
+                 layer_dropout_probability: float = 0.0) -> None:
         super(InputDropoutedStackedBidirectionalLstm, self).__init__()
 
         # Required to be wrapped with a :class:`PytorchSeq2SeqWrapper`.
@@ -289,6 +287,7 @@ class InputDropoutedStackedBidirectionalLstm(torch.nn.Module):
             self.add_module('backward_layer_{}'.format(layer_index), backward_layer)
             layers.append([forward_layer, backward_layer])
         self.lstm_layers = layers
+        self.layer_dropout = InputVariationalDropout(layer_dropout_probability)
 
     def forward(self,  # pylint: disable=arguments-differ
                 inputs: PackedSequence,
@@ -316,6 +315,8 @@ class InputDropoutedStackedBidirectionalLstm(torch.nn.Module):
             backward_output, _ = pad_packed_sequence(backward_output, batch_first=True)
 
             output_sequence = torch.cat([forward_output, backward_output], -1)
+            if i < (self.num_layers - 1):
+                output_sequence = self.layer_dropout(output_sequence)
             output_sequence = pack_padded_sequence(output_sequence, lengths, batch_first=True)
             final_states.append((torch.cat(both_direction_states, -1) for both_direction_states
                                  in zip(final_forward_state, final_backward_state)))

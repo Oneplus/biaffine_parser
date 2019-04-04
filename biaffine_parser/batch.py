@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-from typing import List, Dict
+from typing import List, Dict, Tuple, Union
 import re
 import random
 import torch
@@ -9,6 +9,7 @@ import gzip
 import numpy as np
 from sklearn.cluster import KMeans
 logger = logging.getLogger(__name__)
+Item = Union[List[str], Tuple[str]]
 
 
 class HeadBatch(object):
@@ -17,7 +18,7 @@ class HeadBatch(object):
 
     def create_one_batch(self, batch_size: int,
                          seq_len: int,
-                         raw_dataset: List[List[List[str]]]):
+                         raw_dataset: List[List[Item]]):
         batch_ = torch.LongTensor(batch_size, seq_len).fill_(0)
         for i, raw_data_ in enumerate(raw_dataset):
             for j, fields in enumerate(raw_data_):
@@ -34,7 +35,7 @@ class RelationBatch(object):
         self.mapping = {'<pad>': 0}
         self.n_tags = 1
 
-    def create_dict_from_dataset(self, raw_dataset: List[List[List[str]]]):
+    def create_dict_from_dataset(self, raw_dataset: List[List[Item]]):
         for raw_data_ in raw_dataset:
             for fields in raw_data_:
                 relation = fields[-3]
@@ -44,7 +45,7 @@ class RelationBatch(object):
 
     def create_one_batch(self, batch_size: int,
                          seq_len: int,
-                         raw_dataset_: List[List[List[str]]]):
+                         raw_dataset_: List[List[Item]]):
         batch_ = torch.LongTensor(batch_size, seq_len).fill_(0)
         for i, raw_data_ in enumerate(raw_dataset_):
             for j, fields in enumerate(raw_data_):
@@ -60,7 +61,7 @@ class InputBatchBase(object):
     def __init__(self, use_cuda: bool):
         self.use_cuda = use_cuda
 
-    def create_one_batch(self, raw_dataset_: List[List[List[str]]]):
+    def create_one_batch(self, raw_dataset_: List[List[Item]]):
         raise NotImplementedError()
 
     def get_field(self):
@@ -71,7 +72,7 @@ class TextBatch(InputBatchBase):
     def __init__(self, use_cuda: bool):
         super(TextBatch, self).__init__(use_cuda)
 
-    def create_one_batch(self, raw_dataset_: List[List[List[str]]]):
+    def create_one_batch(self, raw_dataset_: List[List[Item]]):
         ret = []
         for raw_data_ in raw_dataset_:
             ret.append(tuple([fields[1] for fields in raw_data_]))
@@ -85,7 +86,7 @@ class LengthBatch(InputBatchBase):
     def __init__(self, use_cuda: bool):
         super(LengthBatch, self).__init__(use_cuda)
 
-    def create_one_batch(self, raw_dataset: List[List[List[str]]]):
+    def create_one_batch(self, raw_dataset: List[List[Item]]):
         batch_size = len(raw_dataset)
         ret = torch.LongTensor(batch_size).fill_(0)
         for i, raw_data_ in enumerate(raw_dataset):
@@ -120,7 +121,7 @@ class InputBatch(InputBatchBase):
         logger.info('+ to lower: {0}'.format(self.lower))
         logger.info('+ digit normalization: {0}'.format(self.normalize_digits))
 
-    def create_one_batch(self, raw_dataset: List[List[List[str]]]):
+    def create_one_batch(self, raw_dataset: List[List[Item]]):
         batch_size, seq_len = len(raw_dataset), max([len(input_) for input_ in raw_dataset])
         batch = torch.LongTensor(batch_size, seq_len).fill_(1)
         for i, raw_data_ in enumerate(raw_dataset):
@@ -138,7 +139,7 @@ class InputBatch(InputBatchBase):
     def get_field(self):
         return self.field
 
-    def create_dict_from_dataset(self, raw_dataset_: List[List[List[str]]]):
+    def create_dict_from_dataset(self, raw_dataset_: List[List[Item]]):
         counter = collections.Counter()
         for raw_data_ in raw_dataset_:
             for fields in raw_data_:
@@ -189,7 +190,7 @@ class CharacterBatch(InputBatchBase):
         logger.info('{0}'.format(self))
         logger.info('+ field: {0}'.format(self.field))
 
-    def create_one_batch(self, raw_dataset: List[List[List[str]]]):
+    def create_one_batch(self, raw_dataset: List[List[Item]]):
         batch_size = len(raw_dataset)
         seq_len = max([len(input_) for input_ in raw_dataset])
         max_char_len = max([len(fields[self.field]) for raw_data_ in raw_dataset for fields in raw_data_])
@@ -211,7 +212,7 @@ class CharacterBatch(InputBatchBase):
     def get_field(self):
         return self.field
 
-    def create_dict_from_dataset(self, raw_dataset_: List[List[List[str]]]):
+    def create_dict_from_dataset(self, raw_dataset_: List[List[Item]]):
         n_entries = 0
         for raw_data_ in raw_dataset_:
             for fields in raw_data_:
@@ -227,7 +228,7 @@ class CharacterBatch(InputBatchBase):
 
 
 class BatcherBase(object):
-    def __init__(self, raw_dataset_: List[List[List[str]]],
+    def __init__(self, raw_dataset_: List[List[Item]],
                  input_batchers_: Dict[str, InputBatchBase],
                  head_batcher_: HeadBatch,
                  relation_batcher_: RelationBatch,
@@ -270,7 +271,7 @@ class BatcherBase(object):
 
 
 class Batcher(BatcherBase):
-    def __init__(self, raw_dataset_: List[List[List[str]]],
+    def __init__(self, raw_dataset_: List[List[Item]],
                  input_batchers_: Dict[str, InputBatchBase],
                  head_batcher_: HeadBatch,
                  relation_batcher_: RelationBatch,
@@ -295,10 +296,6 @@ class Batcher(BatcherBase):
             new_orders.sort(key=lambda l: len(self.raw_dataset_[l]), reverse=True)
 
         sorted_raw_dataset = [self.raw_dataset_[i] for i in new_orders]
-        orders = [0] * len(new_orders)
-        for i, o in enumerate(new_orders):
-            orders[o] = i
-
         start_id = 0
         self.batch_indices = []
         while start_id < n_inputs:
@@ -311,7 +308,7 @@ class Batcher(BatcherBase):
                 while end_id < n_inputs and len(sorted_raw_dataset[end_id]) == len(sorted_raw_dataset[start_id]):
                     end_id += 1
 
-            one_batch_indices = [orders[o] for o in range(start_id, end_id)]
+            one_batch_indices = [new_orders[o] for o in range(start_id, end_id)]
             if len(one_batch_indices) > 0:
                 self.batch_indices.append(one_batch_indices)
             start_id = end_id
@@ -321,7 +318,7 @@ class Batcher(BatcherBase):
 
 
 class BucketBatcher(BatcherBase):
-    def __init__(self, raw_dataset_: List[List[List[str]]],
+    def __init__(self, raw_dataset_: List[List[Item]],
                  input_batchers_: Dict[str, InputBatchBase],
                  head_batcher_: HeadBatch,
                  relation_batcher_: RelationBatch,
